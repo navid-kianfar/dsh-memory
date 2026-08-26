@@ -1,0 +1,23 @@
+# Build output — reproduced by `pnpm run build` (tsc emit → tsdown bundle).
+lib/
+types/
+tsbuild/
+*.tsbuildinfo
+
+# Packing artifacts
+*.tgz
+
+# Dependencies
+node_modules/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# NOTE: `generated/` is deliberately NOT ignored. It holds the Typert RPC
+# contract, which only the deepseek-harness generator can produce, so this
+# package cannot rebuild it on its own — it ships as committed source.
+# `pnpm test` fails if it drifts from src/host/; see scripts/regen-typert.mjs.
+
+# JetBrains
+.idea/

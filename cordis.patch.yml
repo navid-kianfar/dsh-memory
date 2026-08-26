@@ -1,0 +1,60 @@
+# dsh-memory — persistent, searchable, per-project memory for the DeepSeek Harness.
+#
+# The capability, its model-facing tools, and the browser surface are always composed. The embedding
+# provider is not, because it needs a deployment-specific answer (an endpoint, a model, and usually a
+# credential) that no default can supply. Without it the plugin ranks memories lexically and every
+# other feature — rules, sessions, the manager UI — works unchanged.
+#
+# Override any row from your profile's own cordis.patch.yml by `id`, restating every key the row
+# needs: a patch replaces a row's whole `config`.
+- insert:
+    - id: memory
+      name: '@achasoft/dsh-memory/host'
+      config:
+        # Relative to each project's directory, so every project owns its own memory and none of it
+        # follows you to another checkout. An absolute path here would make one memory serve all.
+        databasePath: .dsh/memory.db
+        # The rule block is a system-prompt section: re-read at every assembly, so rules survive
+        # context compaction. Turning this off keeps the store and the tools but stops enforcement.
+        injectRules: true
+        # The last session summary, sprint goals, and recent decisions, injected once at session
+        # start. History rather than obligation, so it is not repeated per request.
+        injectSessionContext: true
+        autoSession: true
+        # `once` reminds the model to file a summary at the first stop boundary of a session and
+        # never again. `every-turn` matches the Claude Code Stop-hook behaviour; `never` is silent.
+        remind: once
+        # The vector signal's share of a blended similarity. Ignored for a memory with no vector, and
+        # for every memory when no embedding provider is mounted.
+        vectorWeight: 0.6
+        # Permissive because a lexical-only score is normalized against the query's own information
+        # content; raise it once embeddings are on and matches get denser.
+        minSimilarity: 0.05
+        searchLimit: 10
+        candidateLimit: 1000
+        embedBatch: 64
+        toolset: core
+
+    - id: memory-tools
+      name: '@achasoft/dsh-memory/tools'
+      config:
+        # `core` is search, store, recall, rules, add-rule, and end-session. `full` adds listing,
+        # editing, archiving, and the audit trail, at the cost of more prompt tokens every request.
+        toolset: core
+
+    # The BARE package name, deliberately: the Web Client discovers a browser half by resolving
+    # `<row name>/package.json`, so a subpath row here would leave the manager silently unserved.
+    - id: memory-ui
+      name: '@achasoft/dsh-memory'
+
+    # Semantic recall. Any endpoint speaking OpenAI's /v1/embeddings works: a hosted API, a local
+    # inference server, or Ollama. Enable this row and point it at yours.
+    - id: memory-embeddings-openai
+      name: '@achasoft/dsh-memory/embeddings-openai'
+      disabled: true
+      config:
+        baseUrl: https://api.openai.com/v1
+        model: text-embedding-3-small
+        apiKeyEnv: OPENAI_API_KEY
+        timeoutMs: 30000
+        batchSize: 64

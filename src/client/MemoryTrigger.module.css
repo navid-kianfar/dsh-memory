@@ -1,0 +1,61 @@
+/* The memory trigger, in the two boxes its seat needs.
+ *
+ * The sidebar foot's 42px row and 36px rail circle are the shell's own rhythm — the Settings row and
+ * every other footer action use the same geometry, and a foot seat that invented its own would read
+ * as a control from a different application. */
+
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  border: none;
+  background: transparent;
+  color: var(--dsw-alias-label-primary);
+  font-family: inherit;
+  cursor: pointer;
+  overflow: hidden;
+}
+
+.trigger:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.trigger:focus-visible {
+  outline: 2px solid var(--dsw-alias-brand-primary);
+  outline-offset: -2px;
+}
+
+.triggerOpen {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-brand-primary);
+}
+
+/* Expanded sidebar: the foot row shared with Settings — full width, 42px tall, 12px radius, and the
+   same -2px bleed that lets the hover fill reach the column's padding edge. */
+.triggerWide {
+  gap: 8px;
+  width: calc(100% + 4px);
+  height: 42px;
+  margin: 0 -2px;
+  padding: 0 10px 0 8px;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 22px;
+}
+
+.triggerLabel {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Collapsed rail: the same 36px circle as every other rail control. */
+.triggerRail {
+  justify-content: center;
+  gap: 0;
+  width: 36px;
+  height: 36px;
+  margin: 0;
+  padding: 0;
+  border-radius: 50%;
+}
