@@ -1,0 +1,77 @@
+/* The alert banner. One shape, three tones; the tone colours the icon and the hairline rather than
+   flooding the whole strip, so a confirmation does not shout as loudly as a failure. */
+
+.alert {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2);
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.dismiss {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  color: var(--dsw-alias-label-tertiary);
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.dismiss:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.dismiss:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -1px;
+}
+
+.info .icon {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.warn {
+  border-color: var(--dsw-alias-state-warn-primary);
+}
+
+.warn .icon {
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+.error {
+  border-color: var(--dsw-alias-state-error-primary);
+}
+
+.error .icon {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.error .text {
+  color: var(--dsw-alias-label-primary);
+}

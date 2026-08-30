@@ -1,6 +1,6 @@
 {
   "name": "@achasoft/dsh-memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Persistent, searchable, per-project memory for the DeepSeek Harness: decisions, rules, and sprint context in a queryable DuckDB file, rules enforced on every model request, with a full management UI in the Web Client",
   "license": "MIT",
   "type": "module",
@@ -51,10 +51,9 @@
       "inject": [
         "@deepseek-ai/dsh-api-remotes",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-settings",
-        "@deepseek-ai/dsh-client-ui-settings-plugins",
-        "@deepseek-ai/dsh-client-ui-sidebar"
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
       ]
     }
   },
@@ -91,11 +90,10 @@
     "@deepseek-ai/dsh-brand": "link:../../deepseek-harness/packages/util/brand",
     "@deepseek-ai/dsh-client-locale": "link:../../deepseek-harness/packages/client/locale",
     "@deepseek-ai/dsh-client-runtime": "link:../../deepseek-harness/packages/client/runtime",
-    "@deepseek-ai/dsh-client-ui-layout": "link:../../deepseek-harness/packages/client/ui-layout",
+    "@deepseek-ai/dsh-client-ui-conversation": "link:../../deepseek-harness/packages/client/ui-conversation",
     "@deepseek-ai/dsh-client-ui-primitives": "link:../../deepseek-harness/packages/client/ui-primitives",
     "@deepseek-ai/dsh-client-ui-settings": "link:../../deepseek-harness/packages/client/ui-settings",
     "@deepseek-ai/dsh-client-ui-settings-plugins": "link:../../deepseek-harness/packages/client/ui-settings-plugins",
-    "@deepseek-ai/dsh-client-ui-sidebar": "link:../../deepseek-harness/packages/client/ui-sidebar",
     "@deepseek-ai/dsh-client-ui-slots": "link:../../deepseek-harness/packages/client/ui-slots",
     "@deepseek-ai/dsh-credentials": "link:../../deepseek-harness/packages/credentials/credentials",
     "@deepseek-ai/dsh-llm": "link:../../deepseek-harness/packages/llm/llm",
@@ -108,6 +106,7 @@
     "@deepseek-ai/schemastery": "link:../../deepseek-harness/vendor/schemastery",
     "@types/node": "^22.20.1",
     "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.1",
     "happy-dom": "^15.11.7",
     "lightningcss": "^1.30.1",
     "react": "^18.2.0",

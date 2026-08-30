@@ -3,7 +3,7 @@
 # The capability, its model-facing tools, and the browser surface are always composed. The embedding
 # provider is not, because it needs a deployment-specific answer (an endpoint, a model, and usually a
 # credential) that no default can supply. Without it the plugin ranks memories lexically and every
-# other feature — rules, sessions, the manager UI — works unchanged.
+# other feature — rules, sessions, the Memory tab — works unchanged.
 #
 # Override any row from your profile's own cordis.patch.yml by `id`, restating every key the row
 # needs: a patch replaces a row's whole `config`.
@@ -43,7 +43,7 @@
         toolset: core
 
     # The BARE package name, deliberately: the Web Client discovers a browser half by resolving
-    # `<row name>/package.json`, so a subpath row here would leave the manager silently unserved.
+    # `<row name>/package.json`, so a subpath row here would leave the Memory tab silently unserved.
     - id: memory-ui
       name: '@achasoft/dsh-memory'
 

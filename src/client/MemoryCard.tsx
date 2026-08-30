@@ -1,24 +1,32 @@
 /**
- * One memory, as a row in the manager.
+ * One memory, as a row in the Memory view.
  *
  * The card carries what a person needs to decide whether this memory is still true — its category,
- * its age, when it expires, how often it has been useful — and the four verbs that act on that
- * decision. Its audit trail expands in place rather than in a dialog, because "how did this get
- * here" is a question about the row you are already looking at.
+ * its age, when it expires, how often it has been useful — and the verbs that act on that decision.
+ * Its audit trail expands in place rather than in a dialog, because "how did this get here" is a
+ * question about the row you are already looking at.
+ *
+ * The verbs live in one overflow menu rather than a row of four icons. Three of them are rare and
+ * one is destructive, and a delete sitting permanently one pixel from an edit is a delete waiting to
+ * be misclicked; the history toggle stays outside the menu because it acts on this card in place.
+ *
  * @module @achasoft/dsh-memory/client/MemoryCard
  */
 
 import { useState } from 'react'
 import {
-  IconArchiveOutline20, IconChevronDownOutline14, IconEditOutline16, IconRefreshOutline14,
-  IconTrashOutline16,
+  IconArchiveOutline20, IconChevronDownOutline14, IconEditOutline16, IconEllipsisOutline16,
+  IconRefreshOutline14, IconTrashOutline16, Menu, type MenuEntry,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { MemoryProvenanceView, MemoryView } from '../host/types.ts'
 import { categoryLabel, formatDate, formatWhen, isRule } from './format.ts'
 import { cx } from './cx.ts'
 import { useAsync } from './useAsync.ts'
-import css from './MemoryManager.module.css'
+import css from './MemoryScreen.module.css'
+
+/** Past this many characters the body is clamped and offers to unfold. */
+const CLAMP_CHARS = 320
 
 /** Everything one card needs. */
 export interface MemoryCardProps {
@@ -30,7 +38,7 @@ export interface MemoryCardProps {
   readonly tracing: boolean
   /** Expand or collapse this card's audit trail. */
   readonly onToggleTrace: () => void
-  /** Open the editor on this memory. */
+  /** Open the dialog on this memory. */
   readonly onEdit: () => void
   /** Archive it, or restore it when it is already archived. */
   readonly onArchiveOrRestore: () => void
@@ -53,9 +61,30 @@ export interface MemoryCardProps {
 export function MemoryCard(props: MemoryCardProps) {
   const { t, memory, score, tracing, onToggleTrace, onEdit, onArchiveOrRestore, onDelete, readTrace } = props
   const [expanded, setExpanded] = useState(false)
+  const [menuOpen, setMenuOpen] = useState(false)
   const trace = useAsync(readTrace, [memory.id], tracing)
   const archived = memory.status !== 'active'
-  const long = memory.content.length > 320
+  const long = memory.content.length > CLAMP_CHARS
+
+  const items: readonly MenuEntry[] = [
+    { id: 'edit', label: t('card.edit'), icon: <IconEditOutline16 size={14} /> },
+    archived
+      ? { id: 'restore', label: t('card.restore'), icon: <IconRefreshOutline14 size={14} /> }
+      : { id: 'archive', label: t('card.archive'), icon: <IconArchiveOutline20 size={14} /> },
+    { type: 'separator', id: 'sep' },
+    { id: 'delete', label: t('card.delete'), icon: <IconTrashOutline16 size={14} />, danger: true },
+  ]
+
+  /**
+   * Route a menu selection to its verb.
+   * @param id - the selected row's id.
+   */
+  function select(id: string): void {
+    setMenuOpen(false)
+    if (id === 'edit') onEdit()
+    else if (id === 'archive' || id === 'restore') onArchiveOrRestore()
+    else if (id === 'delete') onDelete()
+  }
 
   return (
     <article className={cx(css.card, archived && css.cardArchived, isRule(memory.category) && css.cardRule)}>
@@ -67,6 +96,26 @@ export function MemoryCard(props: MemoryCardProps) {
         {score !== undefined && (
           <span className={css.score}>{t('card.match', { score: score.toFixed(2) })}</span>
         )}
+        <Menu
+          open={menuOpen}
+          portal
+          align="end"
+          items={items}
+          onSelect={select}
+          onClose={() => { setMenuOpen(false) }}
+          anchor={
+            <button
+              type="button"
+              className={css.iconButton}
+              aria-label={t('card.menu')}
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              onClick={() => { setMenuOpen(open => !open) }}
+            >
+              <IconEllipsisOutline16 size={14} />
+            </button>
+          }
+        />
       </header>
 
       <p className={cx(css.cardBody, long && !expanded && css.cardBodyClamped)}>{memory.content}</p>
@@ -109,27 +158,6 @@ export function MemoryCard(props: MemoryCardProps) {
             onClick={onToggleTrace}
           >
             <IconChevronDownOutline14 />
-          </button>
-          <button type="button" className={css.iconButton} title={t('card.edit')} aria-label={t('card.edit')} onClick={onEdit}>
-            <IconEditOutline16 />
-          </button>
-          <button
-            type="button"
-            className={css.iconButton}
-            title={archived ? t('card.restore') : t('card.archive')}
-            aria-label={archived ? t('card.restore') : t('card.archive')}
-            onClick={onArchiveOrRestore}
-          >
-            {archived ? <IconRefreshOutline14 /> : <IconArchiveOutline20 size={16} />}
-          </button>
-          <button
-            type="button"
-            className={cx(css.iconButton, css.iconButtonDanger)}
-            title={t('card.delete')}
-            aria-label={t('card.delete')}
-            onClick={onDelete}
-          >
-            <IconTrashOutline16 />
           </button>
         </span>
       </footer>

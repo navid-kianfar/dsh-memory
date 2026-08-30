@@ -45,11 +45,11 @@ export const TITLE_MAX_CHARS = 500
 /** Longest accepted content, a guard against a runaway paste rather than a considered ceiling. */
 export const CONTENT_MAX_CHARS = 200_000
 
-/** Most tags one memory may carry. */
-const MAX_TAGS = 32
+/** Most tags one memory may carry; the tag field enforces the same ceiling before it writes. */
+export const MAX_TAGS = 32
 
-/** Longest accepted tag. */
-const TAG_MAX_CHARS = 64
+/** Longest accepted tag; the tag field truncates to it as a chip is committed. */
+export const TAG_MAX_CHARS = 64
 
 /** Largest page a listing will return in one call. */
 export const LIST_LIMIT_MAX = 500

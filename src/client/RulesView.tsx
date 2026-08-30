@@ -1,5 +1,5 @@
 /**
- * The Rules tab: what currently binds the model, in the two halves it binds by.
+ * The Rules pane: what currently binds the model, in the two halves it binds by.
  *
  * The rule set arrives with the overview rather than through a read of its own, because it is the
  * same set the header's enforcement pill reports and two reads could disagree with each other on
@@ -10,13 +10,14 @@
  */
 
 import { useState } from 'react'
+import { Button } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { MemoryOverview, MemoryProvenanceView, MemoryView } from '../host/types.ts'
 import { MemoryCard } from './MemoryCard.tsx'
 import { cx, type ClassValue } from './cx.ts'
-import css from './MemoryManager.module.css'
+import css from './MemoryScreen.module.css'
 
-/** Everything the rules tab needs. */
+/** Everything the rules pane needs. */
 export interface RulesViewProps {
   readonly t: TranslateNS<'memory'>
   readonly overview: MemoryOverview
@@ -40,7 +41,7 @@ export interface RulesViewProps {
 }
 
 /**
- * The rules tab.
+ * The rules pane.
  * @param props - the overview and the card verbs.
  * @returns the two rule lists and the injected-text preview.
  * @see {@link RulesViewProps}
@@ -82,14 +83,15 @@ export function RulesView(props: RulesViewProps) {
       {section(t('rules.forbidden'), overview.forbidden, css.ruleHeadingForbidden)}
 
       <section className={css.ruleSection}>
-        <button
-          type="button"
-          className={css.linkButton}
+        <Button
+          variant="outline"
+          size="sm"
+          className={css.blockToggle}
           aria-expanded={showBlock}
           onClick={() => { setShowBlock(!showBlock) }}
         >
           {showBlock ? t('rules.hidePreview') : t('rules.showPreview')}
-        </button>
+        </Button>
         {showBlock && (
           <>
             <h3 className={css.ruleHeading}>{t('rules.preview')}</h3>

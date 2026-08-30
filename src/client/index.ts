@@ -1,22 +1,26 @@
 /**
- * Memory plugin, browser half. Three registrations over one Host endpoint: the sidebar-foot trigger,
- * the manager overlay it opens, and the memory card on the plugin settings tab.
+ * Memory plugin, browser half. Two registrations over one Host endpoint: the Memory view in the
+ * conversation ring, and the memory card on the plugin settings tab.
  *
- * The three share one controller, which is why they are registered together rather than as separate
- * plugins: the trigger has to know whether the manager is open, and the settings card has to be able
- * to open it. That state is registrant-private — nothing outside this package reads it — so it lives
- * in a plain observable rather than behind a cordis service key.
+ * The view is a tab beside Chat rather than an overlay opened from the sidebar. Memory is per
+ * project, and a session IS the project you are in — so the tab already names what it is a view of,
+ * where a sidebar button had to resolve a project of its own and pin it against the session
+ * switching underneath.
+ *
+ * Both seats are registered through `ctx.slots.inject`, because apply order between packages is
+ * unconstrained and a bare `register` into a slot another package declares is an error when this
+ * plugin happens to load first.
  *
  * @module @achasoft/dsh-memory/client
  */
 
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
-import type { ClientContext, SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type { ClientContext, SessionId, SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: the ctx.remote Context merge.
 import type {} from '@deepseek-ai/dsh-api-remotes/client'
-// Type-only: pulls the SlotMap merges of the three slots these entries occupy.
-import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
-import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
+// Type-only: pulls ui-conversation's SlotMap merge, which declares 'conversation.view'.
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
+// Type-only: pulls ui-settings' ctx.settingsScope merge, and ui-settings-plugins' card slot.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 // Type-only: pulls the locale plugin's Context merge (ctx.locale).
@@ -28,16 +32,15 @@ import memoryRemote from '../../generated/typert.remote-client.js'
 import type {
   MemoryCreateRequest, MemoryListRequest, MemorySearchRequest, MemorySettings, MemoryUpdateRequest,
 } from '../host/types.ts'
-import { LOCALE_NS, type ManagerInjected, type SettingsCardInjected, type TriggerInjected } from './contract.ts'
+import { LOCALE_NS, type MemoryScreenInjected, type SettingsCardInjected } from './contract.ts'
 import { MemoryController } from './controller.ts'
-import { MemoryManager } from './MemoryManager.tsx'
+import { MemoryScreen } from './MemoryScreen.tsx'
 import { MemorySettingsCard } from './SettingsCard.tsx'
-import { MemoryTrigger } from './MemoryTrigger.tsx'
 import { en, zh } from './locales.ts'
 import { resolveProjectRoot } from './project.ts'
 
 export type { MemoryKey } from './locales.ts'
-export type { ManagerState, MemoryTab, Notice } from './controller.ts'
+export type { ManagerState, MemoryPane, Notice } from './controller.ts'
 export { MemoryController } from './controller.ts'
 export { resolveProjectRoot } from './project.ts'
 export type { SettingsScope }
@@ -53,7 +56,7 @@ export type { SettingsScope }
 export const inject = ['locale', 'remote']
 
 /**
- * Client plugin body: mount this plugin's own Remote namespace, then register the three surfaces.
+ * Client plugin body: mount this plugin's own Remote namespace, then register the two surfaces.
  * @param ctx - client root context.
  * @returns after the `memory` namespace is callable; its methods are withdrawn when this fiber unloads.
  */
@@ -73,11 +76,27 @@ export async function apply(ctx: ClientContext): Promise<void> {
 }
 
 /**
- * Register the sidebar trigger, the manager overlay, and the settings card.
+ * Register the Memory view and the settings card.
  * @param ctx - the child fiber, with `remote.memory` injected.
  */
 function surface(ctx: ClientContext): void {
-  const controller = new MemoryController()
+  // One controller per session: the view is session-scoped, and two sessions on two projects
+  // sharing a category filter would each be filtering by the other's last choice. Entries are keyed
+  // by session so a tab switched away from and back to comes back where it was left.
+  const controllers = new Map<SessionId, MemoryController>()
+
+  /**
+   * This session's view state, created on first sight of the session.
+   * @param sessionId - the session the view was registered for.
+   * @returns its controller.
+   */
+  const controllerFor = (sessionId: SessionId): MemoryController => {
+    const existing = controllers.get(sessionId)
+    if (existing !== undefined) return existing
+    const created = new MemoryController()
+    controllers.set(sessionId, created)
+    return created
+  }
 
   // Every endpoint returns the carrier's RemoteResult envelope. A transport failure is a different
   // fact from a business failure — the Host returns those as values — so it is thrown here and the
@@ -87,90 +106,84 @@ function surface(ctx: ClientContext): void {
     return result.value
   }
   const remote = ctx.remote.memory
+  const t = ctx.locale.bind(LOCALE_NS)
 
   /**
-   * The project the manager is reading, as every endpoint expects it.
+   * The project one session is bound to, as every endpoint expects it.
+   *
+   * Resolved at call time rather than captured at registration: a session's working directory can
+   * arrive after its view first rendered, and a captured project would keep reading the wrong one.
+   * @param sessionId - the session whose project is wanted; absent asks for the current selection.
    * @returns the `project` field, or nothing when the Host's default is meant.
    */
-  const project = (): { project?: string } => {
-    const root = controller.getSnapshot().projectRoot
+  const project = (sessionId?: SessionId): { project?: string } => {
+    const root = resolveProjectRoot(
+      ctx.sessions.list.getSnapshot(),
+      ctx.workspaces.list.getSnapshot(),
+      sessionId,
+    )
     return root === undefined ? {} : { project: root }
   }
 
-  const managerFace = (): ManagerInjected => ({
-    hooks: { manager: controller },
-    close: () => { controller.close() },
-    refresh: () => { controller.refresh() },
-    setTab: (tab) => { controller.setTab(tab) },
-    setQuery: (query) => { controller.setQuery(query) },
-    setCategory: (category) => { controller.setCategory(category) },
-    setStatus: (status) => { controller.setStatus(status) },
-    compose: (category) => { controller.compose(category) },
-    edit: (memory) => { controller.edit(memory) },
-    closeEditor: () => { controller.closeEditor() },
-    toggleTrace: (id) => { controller.toggleTrace(id) },
-    notify: (tone, text) => { controller.notify(tone, text) },
-    dismissNotice: (id) => { controller.dismissNotice(id) },
-    describe: () => remote.describe(project()).then(unwrap),
-    list: (request: MemoryListRequest) => remote.list({ ...project(), ...request }).then(unwrap),
-    search: (request: MemorySearchRequest, signal) =>
-      remote.search({ ...project(), ...request }, signal).then(unwrap),
-    create: (request: MemoryCreateRequest) => remote.create({ ...project(), ...request }).then(unwrap),
-    update: (request: MemoryUpdateRequest) => remote.update({ ...project(), ...request }).then(unwrap),
-    discard: async (id, hard) => {
-      const result = await remote.discard({ ...project(), id, hard }).then(unwrap)
-      return result.ok ? { rulesChanged: result.rulesChanged } : { error: result.message }
-    },
-    sessions: () => remote.sessions(project()).then(unwrap),
-    provenance: id => remote.provenance({ ...project(), id }).then(unwrap),
-    importInstructions: (text, source) =>
-      remote.importInstructions({ ...project(), text, source }).then(unwrap),
-    exportAll: () => remote.exportAll(project()).then(unwrap),
-    reembed: () => remote.reembed(project()).then(unwrap),
-  })
-
-  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({
-    name: 'sidebar.footer.action',
+  ctx.slots.inject('conversation.view', () => ctx.slots.register({
+    name: 'conversation.view',
     id: 'memory',
-    // After any shipped footer action: this is an addition to the column, not a replacement of
-    // whatever a deployment already put there.
-    order: 40,
+    // After the shipped chat (0) and trajectory (10) tabs, and after a board a deployment may also
+    // compose: memory is a place you go to, not the one you land in.
+    order: 30,
     locale: LOCALE_NS,
-    inject: (): TriggerInjected => ({
-      hooks: { manager: controller },
-      toggle: () => {
-        // The trigger resolves the project at the moment it is pressed rather than subscribing to
-        // it: the manager pins whatever was current when it opened, so an edit in progress cannot
-        // have the memory swapped out from under it by a session switch elsewhere.
-        const sessions = ctx.sessions.list.getSnapshot()
-        const workspaces = ctx.workspaces.list.getSnapshot()
-        controller.toggle(resolveProjectRoot(sessions, workspaces))
-      },
-    }),
-  }, MemoryTrigger))
-
-  ctx.slots.inject('shell.overlay', () => ctx.slots.register({
-    name: 'shell.overlay',
-    id: 'memory-manager',
-    locale: LOCALE_NS,
-    inject: managerFace,
-  }, MemoryManager))
+    // A thunk, so the tab label follows a locale change without re-registering the entry.
+    label: () => t('view.memory'),
+    inject: (sessionId: SessionId): MemoryScreenInjected => {
+      const controller = controllerFor(sessionId)
+      const scope = (): { project?: string } => project(sessionId)
+      return {
+        hooks: { manager: controller },
+        refresh: () => { controller.refresh() },
+        setPane: (pane) => { controller.setPane(pane) },
+        setQuery: (query) => { controller.setQuery(query) },
+        setCategory: (category) => { controller.setCategory(category) },
+        setStatus: (status) => { controller.setStatus(status) },
+        compose: (category) => { controller.compose(category) },
+        edit: (memory) => { controller.edit(memory) },
+        closeEditor: () => { controller.closeEditor() },
+        toggleTrace: (id) => { controller.toggleTrace(id) },
+        notify: (tone, text) => { controller.notify(tone, text) },
+        dismissNotice: (id) => { controller.dismissNotice(id) },
+        describe: () => remote.describe(scope()).then(unwrap),
+        list: (request: MemoryListRequest) => remote.list({ ...scope(), ...request }).then(unwrap),
+        search: (request: MemorySearchRequest, signal) =>
+          remote.search({ ...scope(), ...request }, signal).then(unwrap),
+        create: (request: MemoryCreateRequest) => remote.create({ ...scope(), ...request }).then(unwrap),
+        update: (request: MemoryUpdateRequest) => remote.update({ ...scope(), ...request }).then(unwrap),
+        discard: async (id, hard) => {
+          const result = await remote.discard({ ...scope(), id, hard }).then(unwrap)
+          return result.ok ? { rulesChanged: result.rulesChanged } : { error: result.message }
+        },
+        sessions: () => remote.sessions(scope()).then(unwrap),
+        provenance: id => remote.provenance({ ...scope(), id }).then(unwrap),
+        importInstructions: (text, source) =>
+          remote.importInstructions({ ...scope(), text, source }).then(unwrap),
+        exportAll: () => remote.exportAll(scope()).then(unwrap),
+        reembed: () => remote.reembed(scope()).then(unwrap),
+      }
+    },
+  }, MemoryScreen))
 
   const scope = ctx.settingsScope.bind<MemorySettings>({ namespace: LOCALE_NS })
   ctx.slots.inject('settings.plugin.item', () => ctx.slots.register({
     name: 'settings.plugin.item',
+    // The key IS the host settings namespace: the plugins tab renders the intersection of
+    // registered cards and the namespaces the host reports, so the two halves join on this string.
     key: LOCALE_NS,
     locale: LOCALE_NS,
     inject: (): SettingsCardInjected => ({
       hooks: { settings: scope },
+      // No session to name from the settings dialog, so this reads the current selection's project —
+      // the same one the Memory tab would open on if you switched to it now.
       describe: () => remote.describe(project()).then(unwrap),
       setField: (field, value) => scope.set(field, value),
       unsetField: field => scope.unset(field),
-      openManager: () => {
-        const sessions = ctx.sessions.list.getSnapshot()
-        const workspaces = ctx.workspaces.list.getSnapshot()
-        controller.open(resolveProjectRoot(sessions, workspaces))
-      },
     }),
   }, MemorySettingsCard))
 }

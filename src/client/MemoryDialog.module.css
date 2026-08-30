@@ -1,0 +1,37 @@
+/* The memory dialog's own box. The card, mask, header and footer row are the design system's Modal;
+   this file owns the width the form needs and how it scrolls once the content field grows. */
+
+.dialog {
+  width: min(640px, 100%);
+}
+
+/* The fields scroll, not the card: the title stays readable and Save stays reachable no matter how
+   long the content field gets. Bounded in `vh` so a short viewport shrinks the form rather than
+   pushing the footer off the screen. */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-height: min(58vh, 560px);
+  overflow-y: auto;
+  /* Focus rings sit 1px outside their control; without this the scroll box clips them. */
+  padding: 2px;
+  margin: -2px;
+}
+
+.row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.grow {
+  flex: 1 1 220px;
+}
+
+/* Priority is one digit; a field as wide as the category select would claim it is more. Wide enough
+   for its hint to settle on two lines rather than four. */
+.narrow {
+  flex: 0 0 152px;
+}

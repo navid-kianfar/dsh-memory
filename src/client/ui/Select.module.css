@@ -1,0 +1,47 @@
+/* The select's own pieces. The trigger's shape and the list's surface come from the shared field
+   vocabulary and the design system's Menu; this file owns the dot and the widths. */
+
+/* Menu's wrapper is inline-flex by default, which would shrink the trigger to its text. The field
+   is a grid cell and fills it. */
+.anchor {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+}
+
+.trigger {
+  min-width: 0;
+}
+
+.row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The same colour vocabulary the cards and the filters already use, so a tone means the same thing
+   wherever it is drawn. */
+.dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-tertiary);
+}
+
+.dot[data-tone='success'] {
+  background: var(--dsw-alias-state-success-primary);
+}
+
+.dot[data-tone='warn'] {
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.dot[data-tone='error'] {
+  background: var(--dsw-alias-state-error-primary);
+}
+
+.dot[data-tone='muted'] {
+  background: var(--dsw-alias-label-dimmed);
+}

@@ -13,9 +13,10 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconChevronDownOutline14 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MemorySettings } from '../host/types.ts'
 import type { MemorySettingsCardProps } from './contract.ts'
+import { Alert, Select, TextInput, fields, type SelectOption } from './ui/index.ts'
 import { cx } from './cx.ts'
 import { useAsync } from './useAsync.ts'
 import css from './SettingsCard.module.css'
@@ -43,7 +44,7 @@ type Draft = Partial<Record<keyof MemorySettings, string>>
  * @see {@link MemorySettingsCardProps}
  */
 export function MemorySettingsCard(props: MemorySettingsCardProps) {
-  const { t, useSettings, setField, describe, openManager } = props
+  const { t, useSettings, setField, describe } = props
   const snapshot = useSettings(state => state)
   const settings = snapshot.value
   const writable = snapshot.writable !== false
@@ -128,8 +129,17 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
           ? { tone: css.badgeReady, text: t('settings.embedding.ready', { model: embedding.model ?? embedding.provider ?? '' }) }
           : { tone: css.badgeBlocked, text: t('settings.embedding.blocked', { detail: embedding.detail ?? '' }) }
 
+  const reminders: readonly SelectOption<MemorySettings['remind']>[] = REMINDERS.map(option => ({
+    value: option,
+    label: t(`settings.remind.${option}` as Parameters<typeof t>[0]),
+  }))
+  const toolsets: readonly SelectOption<MemorySettings['toolset']>[] = TOOLSETS.map(option => ({
+    value: option,
+    label: t(`settings.toolset.${option}` as Parameters<typeof t>[0]),
+  }))
+
   return (
-    <li className={cx(css.card, open && css.cardOpen)}>
+    <li className={cx(fields.fields, css.card, open && css.cardOpen)}>
       <button
         type="button"
         className={css.header}
@@ -160,9 +170,9 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
                   embedded: String(overview.value.stats.embedded),
                 })}
               </p>
-              <button type="button" className={css.discard} onClick={openManager}>
-                {t('settings.open')}
-              </button>
+              {/* Where to go, not a button that goes there: the Memory view is a conversation tab,
+                  and no plugin may reach across and switch another package's tab ring. */}
+              <p className={css.hint}>{t('settings.manage')}</p>
             </div>
           )}
 
@@ -187,37 +197,27 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
             onChange={value => { commit('autoSession', value) }}
           />
 
-          <label className={css.field}>
-            <span className={css.head}><span className={css.label}>{t('settings.remind')}</span></span>
-            <select
-              className={css.select}
+          <div className={css.field}>
+            <div className={css.head}><span className={css.label}>{t('settings.remind')}</span></div>
+            <Select
               value={settings.remind}
+              options={reminders}
+              label={t('settings.remind')}
               disabled={!writable}
-              onChange={(event) => { commit('remind', event.target.value) }}
-            >
-              {REMINDERS.map(option => (
-                <option key={option} value={option}>
-                  {t(`settings.remind.${option}` as Parameters<typeof t>[0])}
-                </option>
-              ))}
-            </select>
-          </label>
+              onChange={(next) => { commit('remind', next) }}
+            />
+          </div>
 
-          <label className={css.field}>
-            <span className={css.head}><span className={css.label}>{t('settings.toolset')}</span></span>
-            <select
-              className={css.select}
+          <div className={css.field}>
+            <div className={css.head}><span className={css.label}>{t('settings.toolset')}</span></div>
+            <Select
               value={settings.toolset}
+              options={toolsets}
+              label={t('settings.toolset')}
               disabled={!writable}
-              onChange={(event) => { commit('toolset', event.target.value) }}
-            >
-              {TOOLSETS.map(option => (
-                <option key={option} value={option}>
-                  {t(`settings.toolset.${option}` as Parameters<typeof t>[0])}
-                </option>
-              ))}
-            </select>
-          </label>
+              onChange={(next) => { commit('toolset', next) }}
+            />
+          </div>
 
           <NumberField
             label={t('settings.vectorWeight')}
@@ -250,8 +250,7 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
 
           <div className={css.field}>
             <div className={css.head}><span className={css.label}>{t('settings.databasePath')}</span></div>
-            <input
-              className={css.control}
+            <TextInput
               value={shown('databasePath')}
               disabled={!writable}
               onChange={(event) => { stage('databasePath', event.target.value) }}
@@ -261,23 +260,32 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
 
           {(dirty || failed !== undefined) && (
             <div className={css.footer}>
-              {failed !== undefined && <p className={css.failed}>{failed}</p>}
-              <button
-                type="button"
-                className={css.discard}
+              {failed !== undefined && (
+                <Alert
+                  tone="error"
+                  className={css.failed}
+                  dismissLabel={t('alert.dismiss')}
+                  onDismiss={() => { setFailed(undefined) }}
+                >
+                  {failed}
+                </Alert>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
                 disabled={saving || !dirty}
                 onClick={() => { setDraft({}); setFailed(undefined) }}
               >
                 {t('editor.cancel')}
-              </button>
-              <button
-                type="button"
-                className={css.save}
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
                 disabled={saving || !dirty || invalid || !writable}
                 onClick={save}
               >
                 {saving ? t('editor.saving') : t('editor.save')}
-              </button>
+              </Button>
             </div>
           )}
         </div>
@@ -347,8 +355,7 @@ function NumberField(props: NumberFieldProps) {
   return (
     <div className={css.field}>
       <div className={css.head}><span className={css.label}>{label}</span></div>
-      <input
-        className={invalid ? css.controlInvalid : css.control}
+      <TextInput
         type="number"
         inputMode="decimal"
         step={step}
@@ -356,7 +363,7 @@ function NumberField(props: NumberFieldProps) {
         max={bounds[1]}
         value={value}
         disabled={disabled}
-        aria-invalid={invalid}
+        invalid={invalid}
         onChange={(event) => { onChange(event.target.value) }}
       />
       {invalid && <p className={css.invalid}>{invalidText}</p>}

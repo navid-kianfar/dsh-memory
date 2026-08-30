@@ -11,12 +11,11 @@
 
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
-// Type-only: pulls the SlotMap merges of the three slots these entries occupy.
-import type {} from '@deepseek-ai/dsh-client-ui-layout/client'
-import type {} from '@deepseek-ai/dsh-client-ui-sidebar/client'
+// Type-only: pulls the SlotMap merges of the two slots these entries occupy.
+import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import type { MemoryKey } from './locales.ts'
-import type { MemoryController, MemoryTab } from './controller.ts'
+import type { MemoryController, MemoryPane } from './controller.ts'
 import type {
   MemoryCategoryWire, MemoryCreateRequest, MemoryEmbedResult, MemoryExportResult, MemoryImportResult,
   MemoryListRequest, MemoryListResult, MemoryOverviewResult, MemoryProvenanceResult,
@@ -26,7 +25,7 @@ import type {
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
-    /** Copy of the sidebar trigger, the manager overlay, and the settings card. */
+    /** Copy of the Memory view and the settings card. */
     memory: MemoryKey
   }
 }
@@ -34,61 +33,49 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 /** The locale namespace this plugin owns; the Host joins its settings card on the same name. */
 export const LOCALE_NS = 'memory'
 
-/** Everything the sidebar trigger needs. */
-export interface TriggerInjected {
-  /** Registrant-private reactive sources the renderer binds to `use<Name>` hooks. */
-  hooks: {
-    /** The manager's shared state; the trigger reads whether it is open and writes the toggle. */
-    manager: MemoryController
-  }
-  /** Show or hide the manager for the workspace the sidebar is currently on. */
-  toggle: () => void
-}
-
-/** Full props of the sidebar-foot trigger. */
-export type MemoryTriggerProps =
-  PropsRuntime<'sidebar.footer.action'> & PropsLocale<'memory'> & InjectFace<TriggerInjected>
-
 /**
- * The manager's own verbs.
+ * The screen's own verbs.
  *
  * Flat members rather than the controller itself: `InjectFace` turns the `hooks` compartment into
  * `use<Name>` selector props and passes everything else through untouched, so a component reads
  * state through the hook and changes it through these — it never holds the store. That is what lets
  * every component here render in a test with no controller at all.
  */
-export interface ManagerActions {
-  /** Hide the manager. */
-  close: () => void
+export interface MemoryScreenActions {
   /** Refetch without changing a filter. */
   refresh: () => void
-  /** Switch tabs. */
-  setTab: (tab: MemoryTab) => void
+  /** Switch panes. */
+  setPane: (pane: MemoryPane) => void
   /** Set the search box text; empty means the listing rather than a ranked search. */
   setQuery: (query: string) => void
   /** Restrict the listing to one category, or clear the restriction. */
   setCategory: (category: MemoryCategoryWire | undefined) => void
   /** Choose which lifecycle states the listing shows. */
   setStatus: (status: MemoryStatusWire | 'all') => void
-  /** Open the editor on a new memory of one category. */
+  /** Open the dialog on a new memory of one category. */
   compose: (category: MemoryCategoryWire) => void
-  /** Open the editor on an existing memory. */
+  /** Open the dialog on an existing memory. */
   edit: (memory: MemoryView) => void
-  /** Close the editor without saving. */
+  /** Close the dialog without saving. */
   closeEditor: () => void
   /** Expand or collapse one memory's audit trail. */
   toggleTrace: (id: string) => void
-  /** Show a transient message under the header. */
+  /** Show a transient message under the toolbar. */
   notify: (tone: 'info' | 'error', text: string) => void
   /** Withdraw a notice, unless a newer one replaced it. */
   dismissNotice: (id: number) => void
 }
 
-/** Everything the manager overlay needs. */
-export interface ManagerInjected extends ManagerActions {
+/**
+ * Everything the Memory view needs.
+ *
+ * Every endpoint here is already bound to the project of the session this view was registered for,
+ * so no caller passes one: a view of one session's project cannot read another's by mistake.
+ */
+export interface MemoryScreenInjected extends MemoryScreenActions {
   /** Registrant-private reactive sources the renderer binds to `use<Name>` hooks. */
   hooks: {
-    /** The manager's shared state: which tab, which filters, what is being edited. */
+    /** This session's screen state: which pane, which filters, what is being edited. */
     manager: MemoryController
   }
   /**
@@ -158,9 +145,9 @@ export interface ManagerInjected extends ManagerActions {
   reembed: () => Promise<MemoryEmbedResult>
 }
 
-/** Full props of the manager overlay. */
-export type MemoryManagerProps =
-  PropsRuntime<'shell.overlay'> & PropsLocale<'memory'> & InjectFace<ManagerInjected>
+/** Full props of the Memory view. */
+export type MemoryScreenProps =
+  PropsRuntime<'conversation.view'> & PropsLocale<'memory'> & InjectFace<MemoryScreenInjected>
 
 /** Everything the settings card needs. */
 export interface SettingsCardInjected {
@@ -187,8 +174,6 @@ export interface SettingsCardInjected {
    * @returns settlement after the write.
    */
   unsetField: (field: string) => Promise<void>
-  /** Open the memory manager, so the card is a way in rather than a dead end. */
-  openManager: () => void
 }
 
 /** Full props of the settings card. */

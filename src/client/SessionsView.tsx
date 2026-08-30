@@ -1,5 +1,5 @@
 /**
- * The Sessions tab: what the project remembers about how it has been worked on.
+ * The Sessions pane: what the project remembers about how it has been worked on.
  *
  * A session row is the summary the next session opens with, so this is where a person checks whether
  * that hand-off actually happened — an open row with no summary means an agent stopped without
@@ -10,23 +10,24 @@
 
 import { useCallback } from 'react'
 import type { MemorySessionView } from '../host/types.ts'
-import type { MemoryManagerProps } from './contract.ts'
+import type { MemoryScreenProps } from './contract.ts'
 import { formatWhen } from './format.ts'
+import { Alert } from './ui/index.ts'
 import { cx } from './cx.ts'
 import { useAsync } from './useAsync.ts'
-import css from './MemoryManager.module.css'
+import css from './MemoryScreen.module.css'
 
-/** Everything the sessions tab needs beyond the manager's own props. */
-export interface SessionsViewProps extends MemoryManagerProps {
-  /** The project directory being managed. */
+/** Everything the sessions pane needs beyond the screen's own props. */
+export interface SessionsViewProps extends MemoryScreenProps {
+  /** The project directory being read; the refetch key, not a request argument. */
   readonly projectRoot: string | undefined
-  /** Bumped by the manager to refetch without changing a filter. */
+  /** Bumped by the screen to refetch without changing a filter. */
   readonly revision: number
 }
 
 /**
- * The sessions tab.
- * @param props - the manager's props plus the project and refresh revision.
+ * The sessions pane.
+ * @param props - the screen's props plus the project and refresh revision.
  * @returns the session rows.
  * @see {@link SessionsViewProps}
  */
@@ -41,7 +42,7 @@ export function SessionsView(props: SessionsViewProps) {
   const state = useAsync(read, [projectRoot, revision])
 
   if (state.kind === 'loading') return <p className={css.state}>{t('manager.loading')}</p>
-  if (state.kind === 'failed') return <p className={cx(css.state, css.stateError)}>{state.message}</p>
+  if (state.kind === 'failed') return <Alert tone="error">{state.message}</Alert>
   if (state.value.length === 0) return <p className={css.state}>{t('sessions.empty')}</p>
 
   return (

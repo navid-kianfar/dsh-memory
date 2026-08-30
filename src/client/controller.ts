@@ -1,38 +1,36 @@
 /**
- * The manager's cross-registration state: whether it is open, which tab it is on, what it is
- * editing, and the notice line.
+ * The Memory view's state: which pane it is on, what it is filtered to, what it is editing, and the
+ * notice line.
  *
- * A plain observable rather than a cordis service — the sidebar trigger, the overlay, and the
- * settings card are the only readers, and a service key would be a public name for something
- * private to three registrations.
+ * A plain observable rather than React state, because the view is a conversation tab: switching to
+ * Chat unmounts it, and a filter typed a second ago should still be there when the tab comes back.
+ * One controller per session — the tab is session-scoped, and two sessions on two projects sharing a
+ * category filter would each be filtering by the other's last choice.
  *
  * @module @achasoft/dsh-memory/client/controller
  */
 
 import type { MemoryCategoryWire, MemoryStatusWire, MemoryView } from '../host/types.ts'
 
-/** Which tab of the manager is showing. */
-export type MemoryTab = 'memories' | 'rules' | 'sessions'
+/** Which pane of the Memory view is showing. */
+export type MemoryPane = 'memories' | 'rules' | 'sessions'
 
-/** The editor's state: closed, composing a new memory, or editing an existing one. */
+/** The dialog's state: closed, composing a new memory, or editing an existing one. */
 export type EditorState =
   | { readonly kind: 'closed' }
   | { readonly kind: 'create', readonly category: MemoryCategoryWire }
   | { readonly kind: 'edit', readonly memory: MemoryView }
 
-/** A transient message shown under the manager's header. */
+/** A transient message shown under the view's toolbar. */
 export interface Notice {
   readonly id: number
   readonly tone: 'info' | 'error'
   readonly text: string
 }
 
-/** Everything the manager renders from. */
+/** Everything the view renders from. */
 export interface ManagerState {
-  readonly open: boolean
-  readonly tab: MemoryTab
-  /** The project directory being managed; absent means the Host's default project. */
-  readonly projectRoot: string | undefined
+  readonly pane: MemoryPane
   readonly editor: EditorState
   /** The live search box text; empty means the listing rather than a ranked search. */
   readonly query: string
@@ -45,11 +43,9 @@ export interface ManagerState {
   readonly tracing: string | undefined
 }
 
-/** The manager as it opens: closed, on the memories tab, unfiltered. */
+/** The view as it first opens: on the memories pane, unfiltered. */
 const INITIAL: ManagerState = {
-  open: false,
-  tab: 'memories',
-  projectRoot: undefined,
+  pane: 'memories',
   editor: { kind: 'closed' },
   query: '',
   category: undefined,
@@ -59,7 +55,7 @@ const INITIAL: ManagerState = {
   tracing: undefined,
 }
 
-/** Holds the manager's state and notifies its subscribers. */
+/** Holds one session's view state and notifies its subscribers. */
 export class MemoryController {
   #state: ManagerState = INITIAL
   readonly #listeners = new Set<() => void>()
@@ -94,35 +90,12 @@ export class MemoryController {
   }
 
   /**
-   * Show the manager for one project.
-   * @param projectRoot - the project directory to manage; absent uses the Host's default.
+   * Switch panes, clearing the filters that do not apply to the new one.
+   * @param pane - the pane to show.
    */
-  open(projectRoot: string | undefined): void {
-    this.#commit({ ...this.#state, open: true, projectRoot, editor: { kind: 'closed' } })
-  }
-
-  /** Hide the manager, discarding an in-progress edit. */
-  close(): void {
-    if (!this.#state.open) return
-    this.#commit({ ...this.#state, open: false, editor: { kind: 'closed' }, tracing: undefined })
-  }
-
-  /**
-   * Show the manager, or hide it when it is already showing this project.
-   * @param projectRoot - the project directory the trigger names.
-   */
-  toggle(projectRoot: string | undefined): void {
-    if (this.#state.open && this.#state.projectRoot === projectRoot) { this.close(); return }
-    this.open(projectRoot)
-  }
-
-  /**
-   * Switch tabs, clearing the filters that do not apply to the new one.
-   * @param tab - the tab to show.
-   */
-  setTab(tab: MemoryTab): void {
-    if (tab === this.#state.tab) return
-    this.#commit({ ...this.#state, tab, editor: { kind: 'closed' }, tracing: undefined, category: undefined })
+  setPane(pane: MemoryPane): void {
+    if (pane === this.#state.pane) return
+    this.#commit({ ...this.#state, pane, editor: { kind: 'closed' }, tracing: undefined, category: undefined })
   }
 
   /**
@@ -150,7 +123,7 @@ export class MemoryController {
   }
 
   /**
-   * Open the editor on a new memory.
+   * Open the dialog on a new memory.
    * @param category - the category the form starts on.
    */
   compose(category: MemoryCategoryWire): void {
@@ -158,14 +131,14 @@ export class MemoryController {
   }
 
   /**
-   * Open the editor on an existing memory.
+   * Open the dialog on an existing memory.
    * @param memory - the memory to edit.
    */
   edit(memory: MemoryView): void {
     this.#commit({ ...this.#state, editor: { kind: 'edit', memory } })
   }
 
-  /** Close the editor without saving. */
+  /** Close the dialog without saving. */
   closeEditor(): void {
     if (this.#state.editor.kind === 'closed') return
     this.#commit({ ...this.#state, editor: { kind: 'closed' } })
@@ -185,7 +158,7 @@ export class MemoryController {
   }
 
   /**
-   * Show a transient message under the header.
+   * Show a transient message under the toolbar.
    * @param tone - `info` for a completed action, `error` for one that failed.
    * @param text - the message.
    */

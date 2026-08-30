@@ -1,0 +1,217 @@
+/* The plugin's form vocabulary: one definition of what a field, a trigger, a popover and an option
+   row look like, so the dialog, the toolbar, the filters and the settings card agree.
+
+   Every colour is an alias token; none is a literal. The one thing that cannot be said with a single
+   alias is placeholder text: `--dsw-alias-label-dimmed` is a *disabled* grey and lands near 1.3:1
+   against a dark field, so the placeholder is the one token with an explicit dark value.
+
+   `.fields` carries the whole block and is applied to the screen root and to every portalled
+   surface, because a popover rendered into `document.body` inherits nothing from the screen. */
+
+.fields {
+  --dsh-memory-field-bg: var(--dsw-alias-bg-layer-2);
+  --dsh-memory-field-border: var(--dsw-alias-border-l3);
+  --dsh-memory-field-border-strong: var(--dsw-alias-border-l4);
+  --dsh-memory-field-ring: var(--dsw-alias-state-business-primary);
+  --dsh-memory-field-placeholder: var(--dsw-alias-label-secondary);
+  --dsh-memory-popover-bg: var(--dsw-specific-menu);
+  --dsh-memory-popover-border: var(--dsw-alias-border-inverted);
+}
+
+body[data-ds-dark-theme] .fields {
+  --dsh-memory-field-placeholder: var(--dsw-alias-label-tertiary);
+}
+
+/* ---- Labelled field ---------------------------------------------------- */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.label {
+  font: 500 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+}
+
+.hint {
+  margin: 0;
+  font: 12px/18px var(--dsw-font-family);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.error {
+  margin: 0;
+  font: 12px/18px var(--dsw-font-family);
+  color: var(--dsw-alias-state-error-primary);
+}
+
+/* ---- Text fields ------------------------------------------------------- */
+
+.input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 10px;
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsh-memory-field-bg);
+  border: 1px solid var(--dsh-memory-field-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.input:hover:not(:disabled) {
+  border-color: var(--dsh-memory-field-border-strong);
+}
+
+.input:focus {
+  border-color: var(--dsh-memory-field-ring);
+}
+
+.input::placeholder {
+  color: var(--dsh-memory-field-placeholder);
+}
+
+.input:disabled {
+  cursor: not-allowed;
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.input[aria-invalid='true'] {
+  border-color: var(--dsw-alias-state-error-primary);
+}
+
+/* A multi-line field grows with its rows rather than sitting at the control height. */
+.textarea {
+  height: auto;
+  min-height: 60px;
+  padding: 7px 10px;
+  resize: vertical;
+}
+
+.mono {
+  font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace);
+  font-size: 12px;
+}
+
+/* ---- Trigger (select and every other popover-backed field) ------------- */
+
+/* One button shape for every popover-backed field, so a row of them reads as a row of fields
+   rather than as several different controls. */
+.trigger {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  font: 13px/20px var(--dsw-font-family);
+  text-align: left;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsh-memory-field-bg);
+  border: 1px solid var(--dsh-memory-field-border);
+  border-radius: 8px;
+  cursor: pointer;
+  appearance: none;
+  transition: border-color var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+
+.trigger:hover:not(:disabled) {
+  border-color: var(--dsh-memory-field-border-strong);
+}
+
+.trigger[aria-expanded='true'] {
+  border-color: var(--dsh-memory-field-ring);
+}
+
+.trigger:focus-visible {
+  outline: 2px solid var(--dsh-memory-field-ring);
+  outline-offset: 1px;
+}
+
+.trigger:disabled {
+  cursor: not-allowed;
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.triggerText {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.triggerIcon {
+  flex: 0 0 auto;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ---- Popover surface --------------------------------------------------- */
+
+/* Matches the design system's own dropdown card (menu fill, r12, inverted hairline, lv3) so a
+   picker this plugin builds and a menu the shell builds are the same object. */
+.popover {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--dsh-memory-popover-border);
+  border-radius: 12px;
+  background: var(--dsh-memory-popover-bg);
+  box-shadow: var(--dsw-shadow-lv3);
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);
+}
+
+.popoverScroll {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* ---- Option rows ------------------------------------------------------- */
+
+.option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  font: 13px/20px var(--dsw-font-family);
+  text-align: left;
+  color: var(--dsw-alias-label-primary);
+  background: none;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.option:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.option:focus-visible {
+  outline: 2px solid var(--dsh-memory-field-ring);
+  outline-offset: -2px;
+}
+
+.optionLabel {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trigger {
+    transition: none;
+  }
+}

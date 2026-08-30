@@ -1,0 +1,521 @@
+/* The Memory view's surface.
+ *
+ * Every colour here is an alias token from the harness design platform — never a literal — so the
+ * view follows the shell into light and dark and into any theme a deployment installs. The geometry
+ * follows the shell too: 12px card radius, 8px control radius, and the 13px/14px type scale the
+ * conversation surface already uses, because a tab that invented its own proportions would read as a
+ * control from a different application.
+ *
+ * The view owns its own scroller. It claims the composer-overlay layout (see `MemoryScreen.tsx`),
+ * which hands it the whole column and floats the input card above it; the scrolling body pays for
+ * that with a bottom clearance the size of the card. */
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary);
+  font: 14px/22px var(--dsw-font-family);
+
+  /* ConversationRoot publishes the floating composer's live height. */
+  --dsh-memory-bottom-clearance: calc(var(--dsh-composer-height, 152px) + 16px);
+}
+
+/* ---- toolbar ---- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+}
+
+.panes {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.pane {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 4px 12px;
+  background: none;
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-secondary);
+  cursor: pointer;
+}
+
+.pane:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.pane:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -2px;
+}
+
+.paneActive {
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-primary);
+  font-weight: 500;
+}
+
+.paneCount {
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 11px;
+  line-height: 17px;
+  background: var(--dsw-alias-bg-layer-3);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.fill {
+  flex: 1 1 auto;
+  min-width: 8px;
+}
+
+/* ---- status strip ---- */
+
+/* Where the memory lives and how it is being searched. A strip under the toolbar rather than a
+   footer: the bottom of this column belongs to the floating composer. */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  padding: 5px 16px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  font: 11px/18px var(--dsw-font-family);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.statusPath {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace);
+}
+
+.statusStat {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- body ---- */
+
+.body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 16px var(--dsh-memory-bottom-clearance);
+}
+
+.notice {
+  flex: 0 0 auto;
+  margin: 10px 16px 0;
+  width: auto;
+}
+
+.state {
+  margin: 24px auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  max-width: 460px;
+  font-size: 13px;
+  color: var(--dsw-alias-label-tertiary);
+  text-align: center;
+}
+
+.count {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ---- filters ---- */
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* The search seat is the field vocabulary's own shape, spelled out here because it holds three
+   things rather than one: the icon, the box, and the badge saying how the query will be ranked. */
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 240px;
+  min-width: 200px;
+  box-sizing: border-box;
+  height: 30px;
+  padding: 0 8px 0 10px;
+  border: 1px solid var(--dsh-memory-field-border);
+  border-radius: 8px;
+  background: var(--dsh-memory-field-bg);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.search:hover {
+  border-color: var(--dsh-memory-field-border-strong);
+}
+
+.search:focus-within {
+  border-color: var(--dsh-memory-field-ring);
+}
+
+.searchInput {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: none;
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  outline: none;
+}
+
+.searchInput::placeholder {
+  color: var(--dsh-memory-field-placeholder);
+}
+
+.searchClear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  appearance: none;
+  border: none;
+  border-radius: 50%;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  background: none;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.searchClear:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+/* Wide enough for the longest category name, and fixed so the row does not reflow as it changes. */
+.filter {
+  flex: 0 0 176px;
+}
+
+/* ---- pills and badges ---- */
+
+.pill,
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 17px;
+  font-weight: 500;
+  white-space: nowrap;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.pillOk {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.pillMuted {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.badgeRule {
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+/* ---- cards ---- */
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  padding: 14px 16px;
+  background: var(--dsw-alias-bg-layer-2);
+  transition: border-color .16s;
+}
+
+.card:hover {
+  border-color: var(--dsw-alias-border-l4);
+}
+
+.cardArchived {
+  opacity: 0.6;
+}
+
+/* A rule is a different KIND of entry, not a differently-tagged one: the accent edge is what makes
+   that readable while scanning a mixed list. */
+.cardRule {
+  border-left: 3px solid var(--dsw-alias-state-warn-primary);
+}
+
+.cardHead {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.cardTitle {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 22px;
+  color: var(--dsw-alias-label-primary);
+  overflow-wrap: anywhere;
+}
+
+.score {
+  flex: none;
+  font-size: 11px;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.cardBody {
+  margin: 0;
+  font-size: 13px;
+  line-height: 21px;
+  color: var(--dsw-alias-label-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cardBodyClamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tag {
+  border-radius: 999px;
+  padding: 0 8px;
+  font: 500 11px/18px var(--dsw-font-family);
+  background: var(--dsw-alias-bg-module-platform);
+  border: 1px solid var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.cardFoot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.meta {
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.metaOk {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.metaDot {
+  font-size: 11px;
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.cardActions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.iconButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  appearance: none;
+  border: none;
+  border-radius: 6px;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: none;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.iconButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.iconButton:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -2px;
+}
+
+.iconButtonOn {
+  color: var(--dsw-alias-state-business-primary);
+}
+
+.linkButton {
+  align-self: flex-start;
+  appearance: none;
+  border: none;
+  padding: 0;
+  background: none;
+  font: 12px/18px var(--dsw-font-family);
+  color: var(--dsw-alias-state-business-primary);
+  cursor: pointer;
+}
+
+.linkButton:hover {
+  text-decoration: underline;
+}
+
+/* ---- audit trail ---- */
+
+.trace {
+  border-top: 1px solid var(--dsw-alias-border-l2);
+  padding-top: 8px;
+}
+
+.traceEmpty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.traceList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.traceRow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.traceWhen {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.traceWhat {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.traceWho {
+  margin-left: auto;
+}
+
+/* ---- rules pane ---- */
+
+/* The injected-text toggle is a control in a column of cards, so it holds its own width rather than
+   stretching to the section. */
+.blockToggle {
+  align-self: flex-start;
+}
+
+.ruleSection {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ruleHeading {
+  margin: 8px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.ruleHeadingMandatory {
+  color: var(--dsw-alias-state-success-primary);
+}
+
+.ruleHeadingForbidden {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.block {
+  margin: 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--dsw-alias-markdown-code-block);
+  color: var(--dsw-alias-label-secondary);
+  font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace);
+  font-size: 12px;
+  line-height: 20px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    transition: none;
+  }
+}
