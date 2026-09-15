@@ -11,13 +11,21 @@
  * one project at a time. That is stated in {@link MemoryStoreError} rather than worked around: a
  * second writer would need a daemon, and a daemon is exactly the thing this plugin replaces.
  *
+ * That lock does NOT protect a file from its own process. It is a POSIX advisory lock, which is held
+ * per process, so a second `DuckDBInstance.create` on a file this process already has open succeeds
+ * — and two instances each running their own buffer pool and checkpoints over one file destroy it
+ * ("Serialization Error: Failed to deserialize: field id mismatch"). The same project reached under
+ * two spellings of its path, or a plugin reload that opens before the old fiber has closed, is all
+ * it takes. So every open goes through one process-wide, reference-counted instance per canonical
+ * file path, and only the last release closes it.
+ *
  * @module @achasoft/dsh-memory/host/db
  */
 
 import { DuckDBInstance, DuckDBFloatType, DuckDBListType, DuckDBVarCharType } from '@duckdb/node-api'
 import type { DuckDBConnection } from '@duckdb/node-api'
-import { mkdir } from 'node:fs/promises'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { existsSync, mkdirSync, realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 /**
  * The on-disk layout version.
@@ -56,6 +64,129 @@ export class MemoryStoreError extends Error {
  */
 export function resolveDatabasePath(projectRoot: string, configured: string): string {
   return isAbsolute(configured) ? resolve(configured) : resolve(projectRoot, configured)
+}
+
+/**
+ * The one spelling of a database path that every route to the same file agrees on.
+ *
+ * Symlinks, `..` segments, a trailing slash on the project root, and — on a case-insensitive volume
+ * such as a default macOS disk — letter case all name one file under several strings. The directory
+ * is created first so it can be resolved on disk; the file itself is resolved too once it exists.
+ * @param path - absolute database path, or `:memory:`.
+ * @returns the canonical path, or `:memory:` unchanged.
+ */
+export function canonicalDatabasePath(path: string): string {
+  if (path === ':memory:') return path
+  const absolute = resolve(path)
+  mkdirSync(dirname(absolute), { recursive: true, mode: 0o700 })
+  if (existsSync(absolute)) return realpathSync.native(absolute)
+  return join(realpathSync.native(dirname(absolute)), basename(absolute))
+}
+
+/** One DuckDB instance shared by every open of the same file in this process. */
+interface SharedInstance {
+  readonly instance: Promise<DuckDBInstance>
+  refs: number
+  /**
+   * The layout check and creation, run once per instance. Concurrent first opens would otherwise
+   * each issue the schema DDL, and DuckDB refuses the second with a catalog write-write conflict.
+   */
+  layout?: Promise<void>
+}
+
+/** A reference to a file's instance, as {@link openMemoryDatabase} consumes it. */
+interface AcquiredInstance {
+  readonly instance: DuckDBInstance
+  /** Give the reference back; the last one closes the instance. Idempotent. */
+  readonly release: () => void
+  /**
+   * Run the layout step unless another holder of this instance already has.
+   * @param work - the check-and-create step.
+   * @returns once the layout is in place.
+   */
+  readonly ensureLayout: (work: () => Promise<void>) => Promise<void>
+}
+
+/**
+ * Memoize a layout step on its holder, forgetting a failure so the next open retries it.
+ * @param holder - the object carrying the memo.
+ * @param work - the step.
+ * @returns the step's completion.
+ */
+function layoutOnce(holder: { layout?: Promise<void> }, work: () => Promise<void>): Promise<void> {
+  if (holder.layout === undefined) {
+    const running = work()
+    holder.layout = running
+    running.catch(() => { if (holder.layout === running) delete holder.layout })
+  }
+  return holder.layout
+}
+
+/**
+ * Process-wide so that every copy of this module agrees — the build emits several entry chunks, and
+ * a deployment can load the plugin from a linked checkout and a global install at once.
+ */
+const INSTANCES_KEY = Symbol.for('@achasoft/dsh-memory/duckdb-instances')
+
+/**
+ * The shared instance table.
+ * @returns the table, created on first use.
+ */
+function instances(): Map<string, SharedInstance> {
+  const holder = globalThis as { [INSTANCES_KEY]?: Map<string, SharedInstance> }
+  holder[INSTANCES_KEY] ??= new Map()
+  return holder[INSTANCES_KEY]
+}
+
+/**
+ * Take a reference to the file's instance, creating it when this process holds none.
+ * @param path - canonical database path; `:memory:` always gets a private instance.
+ * @returns the instance and the function that gives the reference back.
+ */
+async function acquireInstance(path: string): Promise<AcquiredInstance> {
+  if (path === ':memory:') {
+    const instance = await DuckDBInstance.create(path)
+    const holder: { layout?: Promise<void> } = {}
+    return {
+      instance,
+      release: () => { instance.closeSync() },
+      ensureLayout: work => layoutOnce(holder, work),
+    }
+  }
+  const table = instances()
+  let entry = table.get(path)
+  if (entry === undefined) {
+    const created: SharedInstance = { instance: DuckDBInstance.create(path), refs: 0 }
+    table.set(path, created)
+    // A failed create must not be handed to the next caller: the usual cause is another process
+    // holding the lock, and that may have cleared by the next attempt.
+    created.instance.catch(() => { if (table.get(path) === created) table.delete(path) })
+    entry = created
+  }
+  entry.refs++
+  const shared = entry
+  let instance: DuckDBInstance
+  try {
+    instance = await shared.instance
+  } catch (error) {
+    shared.refs--
+    throw error
+  }
+  let released = false
+  return {
+    instance,
+    ensureLayout: work => layoutOnce(shared, work),
+    release: () => {
+      if (released) return
+      released = true
+      shared.refs--
+      if (shared.refs > 0) return
+      if (table.get(path) === shared) table.delete(path)
+      // Synchronous, so no second open can slip in between the table losing the entry and the file
+      // being checkpointed and unlocked.
+      instance.closeSync()
+    },
+  }
 }
 
 /**
@@ -180,11 +311,9 @@ const VERSION_KEY = 'schema_version'
  *   this build cannot read.
  */
 export async function openMemoryDatabase(path: string): Promise<OpenMemoryDatabase> {
-  if (path !== ':memory:') await mkdir(dirname(path), { recursive: true, mode: 0o700 })
-
-  let instance: DuckDBInstance
+  let acquired: AcquiredInstance
   try {
-    instance = await DuckDBInstance.create(path)
+    acquired = await acquireInstance(canonicalDatabasePath(path))
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (/lock|being used by another/i.test(message)) {
@@ -196,25 +325,39 @@ export async function openMemoryDatabase(path: string): Promise<OpenMemoryDataba
     throw new MemoryStoreError(`could not open the memory database at "${path}": ${message}`)
   }
 
-  const connection = await instance.connect()
+  let connection: DuckDBConnection
+  try {
+    connection = await acquired.instance.connect()
+  } catch (error) {
+    acquired.release()
+    throw error
+  }
+  let closed = false
   const close = (): void => {
-    connection.closeSync()
-    instance.closeSync()
+    if (closed) return
+    closed = true
+    try {
+      connection.closeSync()
+    } finally {
+      acquired.release()
+    }
   }
   try {
-    const stamped = await readVersion(connection)
-    if (stamped !== undefined && stamped !== MEMORY_SCHEMA_VERSION) {
-      throw new MemoryStoreError(
-        `the memory at "${path}" was written with layout version ${stamped}, which this build `
-        + `(${MEMORY_SCHEMA_VERSION}) cannot read. Move it aside to start fresh, or run a build that matches it.`,
-      )
-    }
-    await connection.run(SCHEMA)
-    if (stamped === undefined) {
-      await connection.run(
-        `INSERT INTO meta (key, value) VALUES ('${VERSION_KEY}', '${MEMORY_SCHEMA_VERSION}')`,
-      )
-    }
+    await acquired.ensureLayout(async () => {
+      const stamped = await readVersion(connection)
+      if (stamped !== undefined && stamped !== MEMORY_SCHEMA_VERSION) {
+        throw new MemoryStoreError(
+          `the memory at "${path}" was written with layout version ${stamped}, which this build `
+          + `(${MEMORY_SCHEMA_VERSION}) cannot read. Move it aside to start fresh, or run a build that matches it.`,
+        )
+      }
+      await connection.run(SCHEMA)
+      if (stamped === undefined) {
+        await connection.run(
+          `INSERT INTO meta (key, value) VALUES ('${VERSION_KEY}', '${MEMORY_SCHEMA_VERSION}')`,
+        )
+      }
+    })
     return { connection, close }
   } catch (error) {
     close()

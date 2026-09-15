@@ -25,7 +25,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { MemoryStore } from './store.ts'
 import { ProjectMemory, type Embedder, type ProjectMemoryOptions } from './memory.ts'
-import { DEFAULT_DATABASE_PATH, MemoryStoreError, resolveDatabasePath } from './db.ts'
+import { DEFAULT_DATABASE_PATH, MemoryStoreError, canonicalDatabasePath, resolveDatabasePath } from './db.ts'
 import { toCategoryCounts, toMemoryView, toProvenanceView, toSessionView } from './views.ts'
 import { parseInstructions } from './import.ts'
 import { DEFAULT_RELEVANCE_WEIGHTS } from '../domain/score.ts'
@@ -147,7 +147,7 @@ export class MemoryService extends TypertRemoteService {
   // private field is keyed to the instance that declared it — so a Remote call arriving through
   // `ctx.memory` cannot read one, and every endpoint fails with a brand-check error at runtime that
   // no type check can see.
-  /** Open memories keyed by absolute project root; a project is opened on first touch. */
+  /** Open memories keyed by canonical database path; a project is opened on first touch. */
   private readonly projects = new Map<string, Promise<ProjectMemory>>()
   /** Per-agent prompt fibers, so a rule set unwinds with the agent that reads it. */
   private readonly promptFibers = new Map<Agent, ReturnType<Context['inject']>>()
@@ -237,18 +237,28 @@ export class MemoryService extends TypertRemoteService {
    */
   async project(projectRoot?: string): Promise<ProjectMemory> {
     const root = projectRoot ?? this.defaultRoot
-    const existing = this.projects.get(root)
-    if (existing !== undefined) return existing
     const options = this.optionsFor(root)
+    // Keyed by the file, not by the string a caller named the project with: the session's cwd and
+    // the browser's workspace root can spell one directory differently, and two ProjectMemory objects
+    // over one database would each hold their own rule cache and session.
+    let key: string
+    try {
+      key = canonicalDatabasePath(options.databasePath)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new MemoryStoreError(`could not open the memory database at "${options.databasePath}": ${message}`)
+    }
+    const existing = this.projects.get(key)
+    if (existing !== undefined) return existing
     const opening = (async () => {
-      const store = await MemoryStore.open(options.databasePath)
-      const project = new ProjectMemory(store, options)
+      const store = await MemoryStore.open(key)
+      const project = new ProjectMemory(store, { ...options, databasePath: key })
       project.setEmbedder(this.embedder())
       await project.refreshRules(Date.now())
       return project
     })()
-    this.projects.set(root, opening)
-    opening.catch(() => { this.projects.delete(root) })
+    this.projects.set(key, opening)
+    opening.catch(() => { if (this.projects.get(key) === opening) this.projects.delete(key) })
     return opening
   }
 

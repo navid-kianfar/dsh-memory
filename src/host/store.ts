@@ -12,7 +12,7 @@
 
 import type { DuckDBConnection, DuckDBPreparedStatement } from '@duckdb/node-api'
 import {
-  FLOAT_LIST, VARCHAR_LIST, openMemoryDatabase, type OpenMemoryDatabase,
+  FLOAT_LIST, MemoryStoreError, VARCHAR_LIST, openMemoryDatabase, type OpenMemoryDatabase,
 } from './db.ts'
 import { toMemory, toProvenance, toSession, type Row } from './rows.ts'
 import { LEXICAL_FIELDS, type CorpusStats, type LexicalDocument } from '../domain/score.ts'
@@ -121,10 +121,12 @@ export class MemoryStore {
    * @returns the work's result.
    */
   private serialize<T>(work: (connection: DuckDBConnection) => Promise<T>): Promise<T> {
-    const result = this.#tail.then(
-      () => work(this.database.connection),
-      () => work(this.database.connection),
-    )
+    // A background embedding pass can outlive the store it was scheduled on; refusing here keeps it
+    // off a connection that has already been handed back.
+    const run = (): Promise<T> => (this.#closed
+      ? Promise.reject(new MemoryStoreError('the memory database has been closed'))
+      : work(this.database.connection))
+    const result = this.#tail.then(run, run)
     this.#tail = result.catch(() => {})
     return result
   }

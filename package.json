@@ -1,6 +1,6 @@
 {
   "name": "@achasoft/dsh-memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Persistent, searchable, per-project memory for the DeepSeek Harness: decisions, rules, and sprint context in a queryable DuckDB file, rules enforced on every model request, with a full management UI in the Web Client",
   "license": "MIT",
   "type": "module",
