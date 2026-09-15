@@ -82,6 +82,9 @@ describe('canonicalDatabasePath', () => {
 })
 
 describe('openMemoryDatabase', () => {
+  // 1,200 real writes against a file on disk: about a second alone, but several times that when the
+  // full suite's workers share the disk, which the 5 s default does not leave room for. The volume is
+  // the point — the corruption this guards against only surfaces after many interleaved writes.
   it('shares one instance across every spelling of a file, so interleaved writes leave it readable', async () => {
     const real = join(root, 'project')
     mkdirSync(real)
@@ -95,7 +98,7 @@ describe('openMemoryDatabase', () => {
     for (const handle of handles) handle.close()
 
     expect(await reopenCount(join(real, '.dsh', 'memory.db'))).toBe(1200)
-  })
+  }, 20_000)
 
   it('keeps the file open for the remaining holders when one of them closes', async () => {
     const path = join(root, 'memory.db')

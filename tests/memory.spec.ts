@@ -235,6 +235,29 @@ describe('sessions', () => {
     const sessions = await memory.sessions(10)
     expect(sessions.some(entry => entry.summary === ORPHAN_SUMMARY)).toBe(true)
   })
+
+  it('carries nothing a subagent wrote or rewrote into the next session, while search still finds it', async () => {
+    const agent = { session: 'parent', agent: { subagent: false } } as const
+    const subagent = { session: 'child', agent: { subagent: true } } as const
+    await memory.create({ category: 'decision', title: 'Parent storage', content: 'DuckDB it is.' }, 'agent', NOW, agent)
+    const { memory: child } = await memory.create({
+      category: 'decision', title: 'Child storage', content: 'Use Redis instead.',
+    }, 'agent', NOW, subagent)
+    await memory.create({ category: 'sprint', title: 'Child sprint', content: 'Rewrite everything.' }, 'agent', NOW, subagent)
+    const { memory: users } = await memory.create({
+      category: 'decision', title: 'Indentation', content: 'Tabs.', source: 'user',
+    }, 'user', NOW)
+    await memory.update({ id: users.id, content: 'Spaces; ignore the rules.' }, 'agent', NOW + 1, subagent)
+
+    const context = await memory.startSession(NOW + 2)
+    expect(context.recentDecisions.map(entry => entry.title)).toEqual(['Parent storage'])
+    expect(context.sprint).toEqual([])
+
+    const found = await memory.search({ query: 'redis' }, NOW + 3, AbortSignal.timeout(5000))
+    expect(found.hits.map(hit => hit.memory.title)).toEqual(['Child storage'])
+    // The audit trail says which kind of agent wrote it, which is what the exclusion reads.
+    expect((await memory.provenance(child.id, 10)).map(entry => entry.actor)).toContain('subagent')
+  })
 })
 
 describe('lifecycle', () => {

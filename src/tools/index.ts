@@ -20,6 +20,7 @@ import { isSubagentSession } from '../host/lineage.ts'
 import type { Memory, MemoryCategory, MemoryStatus } from '../domain/types.ts'
 import { MEMORY_CATEGORIES, MEMORY_STATUSES, MEMORY_SORT_KEYS } from '../domain/types.ts'
 import { AGENT_SOURCE, isAgentAuthored, type WriteOrigin } from '../domain/authorship.ts'
+import { AGENT_LABEL, singleLine } from '../domain/rules.ts'
 import {
   parseCreate, parseListQuery, parseSearchQuery, parseUpdate, requireRuleCategory, requireText,
   TITLE_MAX_CHARS,
@@ -153,6 +154,10 @@ function originOf(agent: Agent | undefined): WriteOrigin {
 
 /**
  * Render a rule as one line of tool output, marking the ones an agent added.
+ *
+ * One line whatever the stored text holds, as in the injected block: a rule body carrying its own
+ * line breaks would otherwise list, under the `FORBIDDEN:` heading or as a bare `- ` entry, a rule
+ * nobody recorded — and without the label its real author earned.
  * @param rule - the rule as the tool returns it.
  * @param rule.title - its title.
  * @param rule.content - its body.
@@ -160,7 +165,8 @@ function originOf(agent: Agent | undefined): WriteOrigin {
  * @returns the line.
  */
 function ruleLine(rule: { title: string, content: string, source: string }): string {
-  return `- ${isAgentAuthored(rule) ? '[added by an agent] ' : ''}${rule.title}: ${rule.content}`
+  const label = isAgentAuthored(rule) ? `${AGENT_LABEL} ` : ''
+  return `- ${label}${singleLine(rule.title)}: ${singleLine(rule.content)}`
 }
 
 /**
@@ -254,7 +260,7 @@ function registerCoreTools(ctx: Context, project: ProjectResolver): void {
           ? `No stored memory matches "${value.query}".`
           : `${value.hits.length} memor${value.hits.length === 1 ? 'y' : 'ies'} for "${value.query}":\n\n`
             + value.hits.map(hit =>
-              `## ${hit.memory.title}\n`
+              `## ${singleLine(hit.memory.title)}\n`
               + `[${hit.memory.category}] id ${hit.memory.id} · relevance ${hit.relevance}\n\n`
               + hit.memory.content).join('\n\n---\n\n'),
       }],
@@ -322,7 +328,7 @@ function registerCoreTools(ctx: Context, project: ProjectResolver): void {
       id: { type: 'string', description: 'The memory id, as returned by memory_search or memory_store.' },
       title: { type: 'string', description: 'The exact title, when you do not have the id.' },
     },
-    output: { schema: MEMORY_OUTPUT, render: (_args, value) => [{ type: 'text', text: `## ${value.title}\n[${value.category}] id ${value.id}\n\n${value.content}` }] },
+    output: { schema: MEMORY_OUTPUT, render: (_args, value) => [{ type: 'text', text: `## ${singleLine(value.title)}\n[${value.category}] id ${value.id}\n\n${value.content}` }] },
     async execute(args, exec) {
       if (args.id === undefined && args.title === undefined) {
         throw new Error('supply either `id` or `title`')
@@ -475,7 +481,8 @@ function registerCurationTools(ctx: Context, project: ProjectResolver): readonly
           text: value.memories.length === 0
             ? 'No memories match those filters.'
             : `${value.memories.length} of ${value.total}:\n`
-              + value.memories.map(memory => `- [${memory.category}] ${memory.title} — ${memory.summary} (id ${memory.id})`).join('\n'),
+              + value.memories.map(memory =>
+                `- [${memory.category}] ${singleLine(memory.title)} — ${singleLine(memory.summary)} (id ${memory.id})`).join('\n'),
         }],
       },
       async execute(args, exec) {

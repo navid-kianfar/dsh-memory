@@ -24,6 +24,8 @@ Rules are injected through the system prompt, not a message, so every request ca
 
 Rules an agent recorded carry an **Added by an agent** badge in the tab and an `[added by an agent]` label in the prompt. When an agent-added rule is present, the block also tells the model that the user's own rules win on conflict.
 
+Each rule is rendered on exactly one line, in the prompt and in `memory_rules` output. Line breaks (CR, LF, U+2028, U+2029), other control characters, and invisible format characters such as bidi overrides and zero-width spaces are collapsed to single spaces in the title and body, so a rule cannot add a heading or an unlabelled rule of its own. ZWNJ and ZWJ are kept. The stored text is unchanged; the Memory tab shows it as written.
+
 ![The Rules pane listing mandatory rules, one of them marked "Added by an agent"](https://raw.githubusercontent.com/navid-kianfar/dsh-memory/main/docs/screenshots/memory-rules.png)
 
 The injected text is bounded, because it is paid for on every request:
@@ -31,13 +33,13 @@ The injected text is bounded, because it is paid for on every request:
 | Limit | Value | When it is reached |
 | --- | --- | --- |
 | One rule in the block | 2,000 characters | The rule is cut, with a marker pointing at `memory_rules`. |
-| The whole rule block | 24,000 characters | Agent-added rules are left out before user rules; a line says how many were left out. |
+| The whole rule block | 24,000 characters | Agent-added rules are left out before user rules, and once any user rule is left out no agent-added rule is shown; a line says how many were left out. |
 | One sprint goal or decision in session context | 1,000 characters | Cut with a marker. |
 | The whole session context | 12,000 characters | Later entries are left out; a line says how many. |
 
 ### Session continuity
 
-Each top-level agent gets its own memory session. When it starts, the model receives one message with the last real session summary (up to 1,500 characters), up to 10 sprint goals, and up to 20 decisions from the last 7 days. Sessions left open by a crash or a disposed agent are closed with an `[auto-closed: …]` summary, which is skipped when picking the last summary. At the end of a turn the model is reminded to call `memory_session_end` (see `remind`).
+Each top-level agent gets its own memory session. When it starts, the model receives one message with the last real session summary (up to 1,500 characters), up to 10 sprint goals, and up to 20 decisions from the last 7 days. Sprint goals and decisions follow the rule block's format: one line each, agent-recorded ones labelled `[added by an agent]`, with a note that the user wins on conflict. Entries a subagent created or edited are left out of this message; they are still found by search and recall. Sessions left open by a crash or a disposed agent are closed with an `[auto-closed: …]` summary, which is skipped when picking the last summary. At the end of a turn the model is reminded to call `memory_session_end` (see `remind`).
 
 A subagent (a session whose header has `origin: 'subagent'` or `delegationDepth > 0`) is bound by the same rules, but gets no memory session, no session context, and no reminder. A user's fork of a session is not a subagent.
 
@@ -241,7 +243,7 @@ A rule is repeated to the model on every request, so the plugin limits who can c
 - **User rules are the user's.** A rule written in the Memory tab or imported from a file can only be edited, archived, or deleted from the Memory tab. A tool call that tries is refused with a message saying so. An agent also cannot turn a user-written memory into a rule.
 - **Agents can add rules and manage their own.** With `toolset: full`, an agent can edit or archive rules that an agent added. It can also edit or archive any non-rule memory, including ones you wrote.
 - **Agent rule caps:** a rule an agent writes is at most 4,000 characters, and a project holds at most 100 live agent-added rules. The user's rules count toward neither limit.
-- **Subagents cannot change rules at all.** They can search, store non-rule memories, and read rules.
+- **Subagents cannot change rules at all.** They can search, store non-rule memories, and read rules. Their writes are recorded in the history with the actor `subagent`, and anything with such a create or edit entry is kept out of the next session's opening context.
 - **Sessions are per agent.** `memory_session_end` closes only the calling agent's own open session. A `session_id` naming another agent's session, a session opened by another process or an earlier run, or one that already ended is refused. Such an open session is closed as an orphan at the next session start.
 - **Authorship is the `source` column.** Only the exact value `assistant` counts as agent-written. Anyone who can write the DuckDB file can change it.
 - **Credentials** for embeddings are referenced by name (`apiKeyEnv`) and never stored in the database or shown in the UI.
@@ -250,6 +252,9 @@ A rule is repeated to the model on every request, so the plugin limits who can c
 
 - **The RPC accepts any project path.** Any authenticated Web Client caller can name any absolute directory as `project`. The plugin then creates `.dsh/memory.db` there and reads or writes it.
 - **`memory_rules` output is not capped.** Unlike the injected block, it returns every rule in full.
+- **Subagent writes recorded by earlier versions are not recognised.** They were recorded with the actor `agent`, so they are labelled as agent-added in session context but not left out of it.
+- **An agent's edit of a memory you wrote is not labelled.** Authorship follows who created the entry, so a decision you wrote and a top-level agent later rewrote is shown unlabelled.
+- **The last session summary is carried as written**, line breaks included. Only top-level agents file summaries.
 - **Changing retention does not recompute existing expiry dates.** New values apply when a memory is created, or when its category or priority changes, or when it is restored.
 - **Single writer per file.** See [Locking](#data-and-storage).
 

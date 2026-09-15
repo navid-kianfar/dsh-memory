@@ -203,6 +203,14 @@ export class MemoryService extends TypertRemoteService {
   private embedderGeneration = 0
   /** The database path open projects were resolved under, to notice when a settings change moves it. */
   private appliedDatabasePath: string
+  /**
+   * The tail of the database-path moves, each run after the previous one settled.
+   *
+   * Two moves running at once — A to B then straight back to A — each re-bind agents and close what
+   * they judge stale from a snapshot the other is changing, so one can re-bind an agent to a file the
+   * other is closing. Never rejects: each move reports its own failure.
+   */
+  private moving: Promise<void> = Promise.resolve()
   private source: () => Config
   /** The fields a person saved in the settings section; undefined while no provider is attached. */
   private userLayer: () => Readonly<Record<string, unknown>> | undefined = () => undefined
@@ -242,6 +250,8 @@ export class MemoryService extends TypertRemoteService {
     })
 
     ctx.effect(() => async () => {
+      // A move in flight opens projects; let it finish so what it opened is in the table closed below.
+      await this.moving
       const bindings = [...this.bindings.values()]
       this.bindings.clear()
       this.attached.clear()
@@ -320,6 +330,12 @@ export class MemoryService extends TypertRemoteService {
    *
    * A failed open is not cached: the usual cause is another process holding the file lock, and a
    * cached rejection would keep answering with that failure after the other process exited.
+   *
+   * An open that completes after the configured database path moved away from its file is closed on
+   * the spot, and the caller gets the project under the current path instead. Nothing else would
+   * close it: the move judges what is stale from the projects that had finished opening, and a
+   * project still opening then would otherwise stay open, holding the old file, for the life of the
+   * plugin.
    * @param projectRoot - absolute project directory; absent uses the Host's default.
    * @returns the project's memory.
    * @throws MemoryStoreError when the database cannot be opened.
@@ -337,32 +353,78 @@ export class MemoryService extends TypertRemoteService {
       const path = resolveDatabasePath(root, this.source().databasePath)
       throw new MemoryStoreError(`could not open the memory database at "${path}": ${message}`)
     }
-    const existing = this.projects.get(key)
-    if (existing !== undefined) return existing
-    const opening = (async () => {
-      const store = await MemoryStore.open(key)
-      // Options are read per call, so a settings change reaches this project without reopening it.
-      const project = new ProjectMemory(store, () => ({ ...this.optionsFor(root), databasePath: key }))
-      try {
-        await project.refreshRules(Date.now())
-        // Visible to the synchronous prompt path only once its rule cache is filled, so an agent
-        // re-bound to it never reads an empty block in between.
-        this.opened.set(key, project)
-        const pending = this.embedder
-        const embedder = await pending
-        // A provider that mounted or went away during the wait has already been applied to every
-        // opened project, this one included; applying the older answer now would undo it.
-        if (pending === this.embedder) project.setEmbedder(embedder)
-        return project
-      } catch (error) {
-        if (this.opened.get(key) === project) this.opened.delete(key)
-        await project.close()
-        throw error
-      }
-    })()
+    const project = await (this.projects.get(key) ?? this.beginOpen(root, key))
+    // Checked by every caller, not only the one that began the open: two roots can share one file
+    // under an absolute path and part again under the moved one.
+    if (this.resolvesTo(root, key)) return project
+    return this.project(root)
+  }
+
+  /**
+   * Begin opening a database file, registered so concurrent callers share the one open.
+   *
+   * When the configured path has moved away from the file by the time the open completes, the
+   * project is closed and forgotten here; {@link project} then re-resolves each waiting caller.
+   * @param root - absolute project directory.
+   * @param key - its canonical database path.
+   * @returns the open in progress.
+   */
+  private beginOpen(root: string, key: string): Promise<ProjectMemory> {
+    const opening: Promise<ProjectMemory> = this.openProject(root, key).then(async (project) => {
+      if (this.resolvesTo(root, key)) return project
+      if (this.opened.get(key) === project) this.opened.delete(key)
+      if (this.projects.get(key) === opening) this.projects.delete(key)
+      await project.close()
+      return project
+    })
     this.projects.set(key, opening)
     opening.catch(() => { if (this.projects.get(key) === opening) this.projects.delete(key) })
     return opening
+  }
+
+  /**
+   * Whether a project root still resolves to a database file under the current configuration.
+   * @param root - absolute project directory.
+   * @param key - the canonical database path it resolved to when its open began.
+   * @returns false when the configured path now names another file — or no resolvable file, in which
+   *   case {@link project} re-resolving it reports why.
+   */
+  private resolvesTo(root: string, key: string): boolean {
+    try {
+      return this.keyFor(root) === key
+    } catch {
+      // Not swallowed: the caller treats this open as stale and re-resolves, which raises the reason.
+      return false
+    }
+  }
+
+  /**
+   * Open one database file as a project and make it visible to the synchronous prompt path.
+   * @param root - absolute project directory.
+   * @param key - its canonical database path.
+   * @returns the opened project, its rule cache filled and the current provider attached.
+   * @throws MemoryStoreError when the database cannot be opened.
+   */
+  private async openProject(root: string, key: string): Promise<ProjectMemory> {
+    const store = await MemoryStore.open(key)
+    // Options are read per call, so a settings change reaches this project without reopening it.
+    const project = new ProjectMemory(store, () => ({ ...this.optionsFor(root), databasePath: key }))
+    try {
+      await project.refreshRules(Date.now())
+      // Visible to the synchronous prompt path only once its rule cache is filled, so an agent
+      // re-bound to it never reads an empty block in between.
+      this.opened.set(key, project)
+      const pending = this.embedder
+      const embedder = await pending
+      // A provider that mounted or went away during the wait has already been applied to every
+      // opened project, this one included; applying the older answer now would undo it.
+      if (pending === this.embedder) project.setEmbedder(embedder)
+      return project
+    } catch (error) {
+      if (this.opened.get(key) === project) this.opened.delete(key)
+      await project.close()
+      throw error
+    }
   }
 
   /**
@@ -471,9 +533,11 @@ export class MemoryService extends TypertRemoteService {
     const databasePath = this.source().databasePath
     if (databasePath === this.appliedDatabasePath) return
     this.appliedDatabasePath = databasePath
-    void this.moveProjects().catch((error: unknown) => {
-      this.ctx.logger.warn(`dsh-memory: could not move to the new database path: ${String(error)}`)
-    })
+    this.moving = this.moving
+      .then(() => this.moveProjects())
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`dsh-memory: could not move to the new database path: ${String(error)}`)
+      })
   }
 
   /**

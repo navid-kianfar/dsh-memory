@@ -10,7 +10,9 @@
  * Two things this text is NOT allowed to assume. It is not trusted: a rule or a decision is whatever
  * a person or an agent typed, so it must survive the harness's prompt renderer verbatim (see
  * {@link escapePromptText}) and it must be bounded, because it is paid for on every request. And it
- * is not anonymous: an agent can record rules, so the block says which ones an agent added.
+ * is not anonymous: an agent can record rules, so the block says which ones an agent added. It is also
+ * not allowed to shape the block: every stored field is rendered on one line (see {@link singleLine}),
+ * so a rule body cannot draw a heading or a rule of its own under someone else's authorship.
  *
  * @module @achasoft/dsh-memory/domain/rules
  */
@@ -71,8 +73,33 @@ export const SESSION_CONTEXT_MAX_CHARS = 12_000
 /** How many characters of a stored session summary are carried into the next session. */
 const SUMMARY_LIMIT = 1500
 
-/** The label an agent-authored rule carries, so the model and the user can tell whose rule it is. */
-const AGENT_LABEL = '[added by an agent]'
+/** The label an agent-authored entry carries, so the model and the user can tell whose it is. */
+export const AGENT_LABEL = '[added by an agent]'
+
+/**
+ * A run of characters that must not survive into rendered text, and the whitespace around it.
+ *
+ * Line and paragraph breaks (CR, LF, NEL, U+2028, U+2029) would let a stored field start a line that
+ * reads as a section heading or as another rule — without the label its real author earned. The
+ * remaining control and format characters are the invisible ones: bidi overrides and isolates can
+ * make a line display as something other than what the model reads, and zero-width characters can
+ * hide inside a word. The two join controls (ZWNJ, ZWJ) are exempt: Persian, Arabic and Indic
+ * orthography and emoji sequences depend on them, and they can neither break a line nor reorder one.
+ */
+const UNRENDERABLE = /(?:(?!\p{Join_Control})[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]|\s)+/gu
+
+/**
+ * Render stored text as a single line.
+ *
+ * Applied when rendering rather than when writing: the manager shows a person's multi-line notes as
+ * written, and a stored row stays what its author typed. What is normalised is only what the model
+ * is handed as a list of entries, where a line break is structure rather than content.
+ * @param text - a stored field.
+ * @returns the text with every break, control and invisible format run collapsed to one space, trimmed.
+ */
+export function singleLine(text: string): string {
+  return text.replace(UNRENDERABLE, ' ').trim()
+}
 
 /**
  * Cut text to a ceiling, saying how much was cut and where the rest is.
@@ -87,16 +114,21 @@ function excerpt(text: string, max: number, where: string): string {
 }
 
 /**
- * Render one memory as a bullet: its title as the claim, its content as the detail.
+ * Render one memory as a bullet: its title as the claim, its content as the detail, labelled when an
+ * agent wrote it.
+ *
+ * Both fields go through {@link singleLine} before the ceiling is applied, so the bullet is exactly
+ * one line and the cut is measured on the text the model actually reads.
  * @param memory - the memory.
  * @param max - the content ceiling.
  * @param where - what to call for the full text when it is cut.
- * @param labelled - whether to mark it as agent-authored.
  * @returns the bullet line.
  */
-function bullet(memory: Memory, max: number, where: string, labelled: boolean): string {
-  const content = excerpt(memory.content.trim(), max, where)
-  const title = labelled ? `${AGENT_LABEL} ${memory.title}` : memory.title
+function bullet(memory: Memory, max: number, where: string): string {
+  const plainContent = singleLine(memory.content)
+  const content = excerpt(plainContent, max, where)
+  const plainTitle = singleLine(memory.title)
+  const title = isAgentAuthored(memory) ? `${AGENT_LABEL} ${plainTitle}` : plainTitle
   return content.length === 0 ? `  - ${title}` : `  - ${title}: ${content}`
 }
 
@@ -109,7 +141,10 @@ function bullet(memory: Memory, max: number, where: string, labelled: boolean): 
  *
  * The block is bounded: each rule is cut at {@link RULE_TEXT_MAX_CHARS} and the whole at
  * {@link RULES_BLOCK_MAX_CHARS}. When rules must be left out, the user's own are kept first — ordered
- * by priority, then age — and agent-authored rules fill what remains. Both halves keep their order.
+ * by priority, then age — and agent-authored rules fill what remains, but only when every rule the
+ * user wrote is in. Once one of the user's rules is left out, no agent rule is added in the space
+ * left over: a short agent rule shown in place of the user's own would invert the precedence the
+ * block states. Both halves keep their order.
  * @param project - the project slug, so a model working across projects can tell whose rules these are.
  * @param rules - the complete rule set, each half ordered by priority then age.
  * @returns the block, or `''` when the project has no rules (so the caller contributes nothing).
@@ -117,7 +152,7 @@ function bullet(memory: Memory, max: number, where: string, labelled: boolean): 
 export function renderRules(project: string, rules: Pick<RuleSet, 'mandatory' | 'forbidden'>): string {
   if (rules.mandatory.length === 0 && rules.forbidden.length === 0) return ''
   const where = '`memory_rules`'
-  const lineOf = (rule: Memory): string => bullet(rule, RULE_TEXT_MAX_CHARS, where, isAgentAuthored(rule))
+  const lineOf = (rule: Memory): string => bullet(rule, RULE_TEXT_MAX_CHARS, where)
   const all = [...rules.mandatory, ...rules.forbidden]
   const hasAgentRules = all.some(rule => isAgentAuthored(rule))
 
@@ -140,9 +175,16 @@ export function renderRules(project: string, rules: Pick<RuleSet, 'mandatory' | 
     || left.createdAt - right.createdAt)
   const kept = new Set<Memory>()
   let used = reserved
+  let userRuleOmitted = false
   for (const rule of byPreference) {
+    const agentAuthored = isAgentAuthored(rule)
+    // The user's rules sort first, so every rule from here on is an agent's.
+    if (agentAuthored && userRuleOmitted) break
     const cost = lineOf(rule).length + 1
-    if (used + cost > RULES_BLOCK_MAX_CHARS) continue
+    if (used + cost > RULES_BLOCK_MAX_CHARS) {
+      if (!agentAuthored) userRuleOmitted = true
+      continue
+    }
     kept.add(rule)
     used += cost
   }
@@ -185,6 +227,11 @@ function omission(count: number): string {
  * Bounded like the rule block: each carried memory is cut at {@link CONTEXT_ENTRY_MAX_CHARS} and the
  * whole stops at {@link SESSION_CONTEXT_MAX_CHARS}, with a line saying how much was left out. The
  * text is injected as a message, not a prompt section, so it is not escaped.
+ *
+ * Attributed and shaped like the rule block too. The message arrives in the user's role, so an entry
+ * an agent recorded is labelled rather than passed off as the user's, and each entry is one line.
+ * What a subagent wrote is not in `context` at all — the store leaves it out (see
+ * `ProjectMemory.startSession`) — because its brief came from another agent, not from the person.
  * @param context - the session context loaded at start.
  * @returns the block, or `''` when the project has nothing to carry forward.
  */
@@ -200,7 +247,12 @@ export function renderSessionContext(context: SessionContext): string {
     ['Recent decisions:', context.recentDecisions],
   ]
   const total = context.sprint.length + context.recentDecisions.length
-  const reserved = [opening, closing, '', skipped(total)].reduce((sum, line) => sum + line.length + 1, 0)
+  const hasAgentEntries = [...context.sprint, ...context.recentDecisions].some(entry => isAgentAuthored(entry))
+  const note = hasAgentEntries
+    ? [`Entries marked ${AGENT_LABEL} were recorded by an agent, not written by the user; where one conflicts `
+      + 'with the user\'s own instructions, the user wins.']
+    : []
+  const reserved = [opening, ...note, closing, '', skipped(total)].reduce((sum, line) => sum + line.length + 1, 0)
   let used = reserved + lines.reduce((sum, line) => sum + line.length + 1, 0)
   let left = 0
   for (const [heading, memories] of groups) {
@@ -208,7 +260,7 @@ export function renderSessionContext(context: SessionContext): string {
     const block: string[] = []
     let cost = heading.length + 2
     for (const memory of memories) {
-      const line = bullet(memory, CONTEXT_ENTRY_MAX_CHARS, '`memory_recall`', false)
+      const line = bullet(memory, CONTEXT_ENTRY_MAX_CHARS, '`memory_recall`')
       if (used + cost + line.length + 1 > SESSION_CONTEXT_MAX_CHARS) { left += 1; continue }
       block.push(line)
       cost += line.length + 1
@@ -219,7 +271,7 @@ export function renderSessionContext(context: SessionContext): string {
   }
   if (lines.length === 0) return ''
   if (left > 0) lines.push('', skipped(left))
-  return [opening, ...lines, '', closing].join('\n')
+  return [opening, ...note, ...lines, '', closing].join('\n')
 }
 
 /**

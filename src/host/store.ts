@@ -363,21 +363,30 @@ export class MemoryStore {
    * @param limit - most rows to return.
    * @param now - the current time, for evaluating expiry.
    * @param since - when given, only memories created at or after this time.
+   * @param excludeWrittenBy - when given, leave out every memory with a `create` or `update` audit
+   *   entry by this actor. Applied in the query rather than to the page, so `limit` counts rows that
+   *   are returned.
    * @returns the memories, newest first.
    */
   async byCategory(
-    category: MemoryCategory, limit: number, now: number, since?: number,
+    category: MemoryCategory, limit: number, now: number, since?: number, excludeWrittenBy?: string,
   ): Promise<Memory[]> {
     return this.serialize(async (connection) => {
       const sinceClause = since === undefined ? '' : ' AND created_at >= $4'
+      const writerIndex = since === undefined ? 4 : 5
+      const writerClause = excludeWrittenBy === undefined
+        ? ''
+        : ' AND NOT EXISTS (SELECT 1 FROM provenance WHERE provenance.memory_id = memories.id'
+          + ` AND provenance.actor = $${writerIndex} AND provenance.operation IN ('create', 'update'))`
       const statement = await connection.prepare(
         `SELECT ${COLUMNS} FROM memories WHERE category = $1 AND ${LIVE.replace('?', '$2')}`
-        + `${sinceClause} ORDER BY priority DESC, created_at DESC LIMIT $3`,
+        + `${sinceClause}${writerClause} ORDER BY priority DESC, created_at DESC LIMIT $3`,
       )
       statement.bindVarchar(1, category)
       statement.bindBigInt(2, BigInt(now))
       statement.bindInteger(3, limit)
       if (since !== undefined) statement.bindBigInt(4, BigInt(since))
+      if (excludeWrittenBy !== undefined) statement.bindVarchar(writerIndex, excludeWrittenBy)
       return (await statement.runAndReadAll()).getRowObjects().map(toMemory)
     })
   }

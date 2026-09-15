@@ -25,6 +25,20 @@ import { RULE_CATEGORIES, type Memory, type MemoryCategory } from './types.ts'
  */
 export const AGENT_SOURCE = 'assistant'
 
+/**
+ * The audit actor recorded for anything a subagent writes, whatever label its caller passed.
+ *
+ * A subagent's brief came from another agent rather than from the person, so what it records is kept
+ * out of the context the next top-level session opens with (it stays searchable). The provenance
+ * trail carries that fact rather than `source`, for two reasons. `source` is the authorship contract
+ * — documented, and tested by every consumer, as exactly {@link AGENT_SOURCE} for agent-written — so
+ * a new value would read as a person's entry everywhere that test runs. And the trail records every
+ * write, not just the first: a subagent that rewrites an entry someone else created has written the
+ * text the next session would read, and that edit marks the entry too. The trail is written by this
+ * plugin inside the write's transaction, never by the model.
+ */
+export const SUBAGENT_ACTOR = 'subagent'
+
 /** Most live rules agents may hold in one project; the user's own rules do not count against it. */
 export const AGENT_RULE_LIMIT = 100
 
@@ -81,6 +95,16 @@ export function isRuleCategory(category: MemoryCategory): boolean {
  */
 export function isAgentAuthored(memory: Pick<Memory, 'source'>): boolean {
   return memory.source === AGENT_SOURCE
+}
+
+/**
+ * The actor a write is audited under.
+ * @param actor - the label the caller passed: `agent`, `user`, or its own.
+ * @param origin - who is writing.
+ * @returns {@link SUBAGENT_ACTOR} for a subagent's write, otherwise the caller's label.
+ */
+export function auditActor(actor: string, origin: WriteOrigin | undefined): string {
+  return origin?.agent?.subagent === true ? SUBAGENT_ACTOR : actor
 }
 
 /**

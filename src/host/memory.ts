@@ -19,8 +19,8 @@ import { asOf, effectiveStatus, expiresAt } from '../domain/retention.ts'
 import { renderRules } from '../domain/rules.ts'
 import { MemoryNotFoundError } from '../domain/validate.ts'
 import {
-  AGENT_SOURCE, MemoryForbiddenError, assertAgentMayChange, assertAgentMayCreate, isRuleCategory,
-  type WriteOrigin,
+  AGENT_SOURCE, MemoryForbiddenError, SUBAGENT_ACTOR, assertAgentMayChange, assertAgentMayCreate, auditActor,
+  isRuleCategory, type WriteOrigin,
 } from '../domain/authorship.ts'
 import {
   RULE_MIN_PRIORITY,
@@ -290,8 +290,9 @@ export class ProjectMemory {
       const agentRules = origin?.agent !== undefined && isRule ? await tx.countLiveRules(AGENT_SOURCE, now) : 0
       assertAgentMayCreate(input.category, input.content, origin, agentRules)
       const inserted = await tx.insert(stored)
+      const audited = auditActor(actor, origin)
       await tx.recordProvenance({
-        memoryId: inserted.id, operation: 'create', actor, at: now,
+        memoryId: inserted.id, operation: 'create', actor: audited, at: now,
         details: { category: inserted.category, title: inserted.title, entities: inserted.entities.length },
       })
       return inserted
@@ -330,7 +331,8 @@ export class ProjectMemory {
       const { columns, changed } = ProjectMemory.derivePatch(existing, patch, now, options)
       const updated = await tx.update(patch.id, columns, now)
       if (updated === undefined) throw new MemoryNotFoundError(`no memory with id "${patch.id}"`)
-      await tx.recordProvenance({ memoryId: updated.id, operation: 'update', actor, at: now, details: { changed } })
+      const audited = auditActor(actor, origin)
+      await tx.recordProvenance({ memoryId: updated.id, operation: 'update', actor: audited, at: now, details: { changed } })
       return { memory: updated, rulesChanged: isRuleCategory(existing.category) || isRuleCategory(category) }
     })
     if (rulesChanged) await this.rulesDidChange(now)
@@ -449,8 +451,9 @@ export class ProjectMemory {
       const { columns } = ProjectMemory.derivePatch(existing, { id, status }, now, options)
       const updated = await tx.update(id, columns, now)
       if (updated === undefined) throw new MemoryNotFoundError(`no memory with id "${id}"`)
+      const audited = auditActor(actor, origin)
       await tx.recordProvenance({
-        memoryId: id, operation, actor, at: now, ...reason === undefined ? {} : { details: { reason } },
+        memoryId: id, operation, actor: audited, at: now, ...reason === undefined ? {} : { details: { reason } },
       })
       return { memory: updated, rulesChanged: isRuleCategory(existing.category) }
     })
@@ -681,6 +684,10 @@ export class ProjectMemory {
    * that actually ended with something to say. A session another agent in this process still owns is
    * NOT an orphan — it is open because it is in use — so it is left alone; only this owner's own
    * previous session, replaced by this start, is closed with the marker.
+   *
+   * Sprint goals and decisions a subagent created or edited are not carried: the context arrives in
+   * the user's role, and a subagent's brief came from another agent (see `SUBAGENT_ACTOR`). They are
+   * filtered in the query, so the limits still count entries that will actually be shown.
    * @param now - the start time.
    * @param owner - the harness session id of the agent the session belongs to.
    * @returns the rules, last summary, sprint goals, and recent decisions.
@@ -703,9 +710,9 @@ export class ProjectMemory {
 
     const rules = await this.refreshRules(now)
     const lastSummary = await this.store.lastSummary(ORPHAN_SUMMARY)
-    const sprint = await this.store.byCategory('sprint', SPRINT_LIMIT, now)
+    const sprint = await this.store.byCategory('sprint', SPRINT_LIMIT, now, undefined, SUBAGENT_ACTOR)
     const recentDecisions = await this.store.byCategory(
-      'decision', DECISION_LIMIT, now, now - DECISION_WINDOW_DAYS * DAY_MS,
+      'decision', DECISION_LIMIT, now, now - DECISION_WINDOW_DAYS * DAY_MS, SUBAGENT_ACTOR,
     )
     return {
       sessionId: id,
