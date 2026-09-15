@@ -257,6 +257,10 @@
   color: var(--dsw-alias-state-warn-primary);
 }
 
+.badgeAgent {
+  color: var(--dsw-alias-label-tertiary);
+}
+
 /* ---- cards ---- */
 
 .rows {

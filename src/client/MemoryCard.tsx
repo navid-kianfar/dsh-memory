@@ -20,7 +20,7 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
 import type { MemoryProvenanceView, MemoryView } from '../host/types.ts'
-import { categoryLabel, formatDate, formatWhen, isRule } from './format.ts'
+import { categoryLabel, formatDate, formatWhen, isAgentAuthored, isRule } from './format.ts'
 import { cx } from './cx.ts'
 import { useAsync } from './useAsync.ts'
 import css from './MemoryScreen.module.css'
@@ -92,6 +92,13 @@ export function MemoryCard(props: MemoryCardProps) {
         <span className={cx(css.badge, isRule(memory.category) && css.badgeRule)}>
           {categoryLabel(t, memory.category)}
         </span>
+        {/* A rule an agent recorded binds like the user's own, so the user has to be able to tell
+            them apart at a glance — the same distinction the injected block makes for the model. */}
+        {isRule(memory.category) && isAgentAuthored(memory) && (
+          <span className={cx(css.badge, css.badgeAgent)} title={t('card.agentAuthoredHint')}>
+            {t('card.agentAuthored')}
+          </span>
+        )}
         <h3 className={css.cardTitle}>{memory.title}</h3>
         {score !== undefined && (
           <span className={css.score}>{t('card.match', { score: score.toFixed(2) })}</span>

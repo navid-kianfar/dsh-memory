@@ -51,17 +51,21 @@ const PRIORITY_MULTIPLIER: Readonly<Record<number, number | null>> = {
  * @param category - the memory's category.
  * @param priority - its priority; at or above {@link RULE_MIN_PRIORITY} nothing expires.
  * @param now - the current time, epoch milliseconds.
- * @param table - per-category lifetimes; defaults to {@link DEFAULT_RETENTION_DAYS}.
+ * @param table - per-category lifetimes; defaults to {@link DEFAULT_RETENTION_DAYS}. A category the
+ *   table leaves out (or maps to `undefined`) takes the default; a category it maps to `null` never
+ *   expires. The two must stay distinct: `null` is how a deployment's "0 days" arrives, and a `??`
+ *   fallback would silently turn "never" back into the default.
  * @returns the expiry in epoch milliseconds, or undefined when this memory never expires.
  */
 export function expiresAt(
   category: MemoryCategory,
   priority: number,
   now: number,
-  table: Readonly<Partial<Record<MemoryCategory, number | null>>> = DEFAULT_RETENTION_DAYS,
+  table: Readonly<Partial<Record<MemoryCategory, number | null | undefined>>> = DEFAULT_RETENTION_DAYS,
 ): number | undefined {
   if (priority >= RULE_MIN_PRIORITY) return undefined
-  const days = table[category] ?? DEFAULT_RETENTION_DAYS[category]
+  const configured = table[category]
+  const days = configured === undefined ? DEFAULT_RETENTION_DAYS[category] : configured
   if (days === null || days === undefined) return undefined
   const multiplier = PRIORITY_MULTIPLIER[priority]
   if (multiplier === null || multiplier === undefined) return undefined

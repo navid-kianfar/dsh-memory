@@ -14,7 +14,7 @@ import type { DuckDBConnection, DuckDBPreparedStatement } from '@duckdb/node-api
 import {
   FLOAT_LIST, MemoryStoreError, VARCHAR_LIST, openMemoryDatabase, type OpenMemoryDatabase,
 } from './db.ts'
-import { toMemory, toProvenance, toSession, type Row } from './rows.ts'
+import { toMemory, toProvenance, toSession } from './rows.ts'
 import { LEXICAL_FIELDS, type CorpusStats, type LexicalDocument } from '../domain/score.ts'
 import type {
   ListMemoriesQuery, Memory, MemoryCategory, MemoryPage, MemorySession, MemoryStats, MemoryStatus,
@@ -84,8 +84,10 @@ export interface CandidateSet {
 
 /** The project's memory, and every operation over it. */
 export class MemoryStore {
-  #tail: Promise<unknown> = Promise.resolve()
+  #tail: Promise<void> = Promise.resolve()
   #closed = false
+  /** Settles once the queue drained and the connection was handed back. */
+  #released: Promise<void> = Promise.resolve()
 
   /**
    * @param database - the open connection and its release function.
@@ -102,14 +104,23 @@ export class MemoryStore {
     return new MemoryStore(await openMemoryDatabase(path))
   }
 
-  /** Release the database lock. Idempotent; queued work settles first. */
+  /**
+   * Release the database lock. Idempotent.
+   *
+   * Work already queued when this is called still runs — a caller whose write was accepted gets its
+   * write — and only work submitted afterwards is refused. The connection is handed back once the
+   * queue has drained.
+   */
   async close(): Promise<void> {
-    if (this.#closed) return
+    if (this.#closed) return this.#released
     this.#closed = true
-    // Take the tail so a caller mid-statement is not closed out from under; the queue only ever
-    // settles, because `serialize` swallows rejections into the tail.
-    await this.#tail.catch(() => {})
-    this.database.close()
+    this.#released = (async () => {
+      // The queue only ever settles, because `serialize` keeps each caller's rejection out of the
+      // tail; waiting on it is waiting for the last accepted unit of work.
+      await this.#tail
+      this.database.close()
+    })()
+    return this.#released
   }
 
   /**
@@ -119,41 +130,59 @@ export class MemoryStore {
    * next caller still starts from a settled tail rather than inheriting the failure.
    * @param work - the statements to run.
    * @returns the work's result.
+   * @throws MemoryStoreError when the store was closed before this work was submitted.
    */
   private serialize<T>(work: (connection: DuckDBConnection) => Promise<T>): Promise<T> {
-    // A background embedding pass can outlive the store it was scheduled on; refusing here keeps it
-    // off a connection that has already been handed back.
-    const run = (): Promise<T> => (this.#closed
-      ? Promise.reject(new MemoryStoreError('the memory database has been closed'))
-      : work(this.database.connection))
+    // Checked at submission, not when the work reaches the front of the queue: a background
+    // embedding pass can outlive the store it was scheduled on, and must not be queued behind a
+    // close, while work accepted before the close is owed its result.
+    if (this.#closed) return Promise.reject(new MemoryStoreError('the memory database has been closed'))
+    const run = (): Promise<T> => work(this.database.connection)
     const result = this.#tail.then(run, run)
-    this.#tail = result.catch(() => {})
+    this.#tail = result.then(() => {}, () => {})
     return result
   }
 
   /**
-   * Bind a memory's columns onto a prepared insert or replace.
-   * @param statement - the prepared statement, whose first 18 parameters are the column list.
-   * @param memory - the values to bind.
+   * Run several statements as one DuckDB transaction on the serialized connection.
+   *
+   * Either every statement the work issues commits or none does. The work runs with the connection
+   * held, so it must not call back into this store's public methods — those queue behind it and
+   * would wait forever; the transaction handle offers the statements a composite write needs.
+   * @param work - the statements to run, given a handle valid only until the work settles.
+   * @returns the work's result, after the commit.
+   * @throws the work's own rejection, after the rollback.
    */
-  private static bindMemory(statement: DuckDBPreparedStatement, memory: StoredMemory): void {
-    statement.bindVarchar(1, memory.id)
-    statement.bindVarchar(2, memory.category)
-    statement.bindVarchar(3, memory.title)
-    statement.bindVarchar(4, memory.content)
-    statement.bindVarchar(5, memory.summary)
-    statement.bindList(6, [...memory.tags], VARCHAR_LIST)
-    statement.bindList(7, [...memory.entities], VARCHAR_LIST)
-    statement.bindList(8, [...memory.relatedIds], VARCHAR_LIST)
-    if (memory.metadata === undefined) statement.bindNull(9)
-    else statement.bindVarchar(9, JSON.stringify(memory.metadata))
-    statement.bindVarchar(10, memory.status)
-    statement.bindInteger(11, memory.priority)
-    statement.bindVarchar(12, memory.source)
-    if (memory.expiresAt === undefined) statement.bindNull(13)
-    else statement.bindBigInt(13, BigInt(memory.expiresAt))
-    statement.bindBigInt(14, BigInt(memory.createdAt))
-    statement.bindBigInt(15, BigInt(memory.updatedAt))
+  async transaction<T>(work: (tx: MemoryTransaction) => Promise<T>): Promise<T> {
+    return this.serialize(async (connection) => {
+      const statements = new MemoryStatements(connection)
+      await connection.run('BEGIN TRANSACTION')
+      let result: T
+      try {
+        result = await work(statements)
+      } catch (error) {
+        statements.revoke()
+        await MemoryStore.rollback(connection, error)
+        throw error
+      }
+      statements.revoke()
+      await connection.run('COMMIT')
+      return result
+    })
+  }
+
+  /**
+   * Roll a failed transaction back, keeping the failure that caused it.
+   * @param connection - the connection holding the open transaction.
+   * @param cause - why the transaction is being abandoned.
+   * @throws AggregateError carrying both failures when the rollback itself fails.
+   */
+  private static async rollback(connection: DuckDBConnection, cause: unknown): Promise<void> {
+    try {
+      await connection.run('ROLLBACK')
+    } catch (rollbackError) {
+      throw new AggregateError([cause, rollbackError], 'a memory write failed and could not be rolled back')
+    }
   }
 
   /**
@@ -162,16 +191,7 @@ export class MemoryStore {
    * @returns the stored memory as it reads back.
    */
   async insert(memory: StoredMemory): Promise<Memory> {
-    return this.serialize(async (connection) => {
-      const statement = await connection.prepare(
-        'INSERT INTO memories (id, category, title, content, summary, tags, entities, related_ids, '
-        + 'metadata, status, priority, source, expires_at, created_at, updated_at) '
-        + 'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)',
-      )
-      MemoryStore.bindMemory(statement, memory)
-      await statement.run()
-      return MemoryStore.one(await this.read(connection, memory.id)) as Memory
-    })
+    return this.serialize(async connection => new MemoryStatements(connection).insert(memory))
   }
 
   /**
@@ -180,29 +200,7 @@ export class MemoryStore {
    * @returns the memory, or undefined when the project does not hold it.
    */
   async get(id: string): Promise<Memory | undefined> {
-    return this.serialize(async connection => MemoryStore.one(await this.read(connection, id)))
-  }
-
-  /**
-   * Read one row by id on an already-held connection.
-   * @param connection - the connection this call owns.
-   * @param id - the memory id.
-   * @returns the matching rows (zero or one).
-   */
-  private async read(connection: DuckDBConnection, id: string): Promise<Row[]> {
-    const statement = await connection.prepare(`SELECT ${COLUMNS} FROM memories WHERE id = $1`)
-    statement.bindVarchar(1, id)
-    return (await statement.runAndReadAll()).getRowObjects()
-  }
-
-  /**
-   * Map the first row of a result, if there is one.
-   * @param rows - the result rows.
-   * @returns the mapped memory, or undefined for an empty result.
-   */
-  private static one(rows: readonly Row[]): Memory | undefined {
-    const [row] = rows
-    return row === undefined ? undefined : toMemory(row)
+    return this.serialize(async connection => new MemoryStatements(connection).read(id))
   }
 
   /**
@@ -220,7 +218,8 @@ export class MemoryStore {
         + 'ORDER BY updated_at DESC LIMIT 1',
       )
       statement.bindVarchar(1, title)
-      return MemoryStore.one((await statement.runAndReadAll()).getRowObjects())
+      const [row] = (await statement.runAndReadAll()).getRowObjects()
+      return row === undefined ? undefined : toMemory(row)
     })
   }
 
@@ -289,82 +288,32 @@ export class MemoryStore {
    *
    * The caller supplies already-derived columns — a changed title or content arrives with its new
    * summary and entities — because deriving them needs the domain layer and this module holds only
-   * SQL.
+   * SQL. A patch that must be derived from the row as it currently is belongs in a
+   * {@link transaction}, which reads and writes without another caller in between.
    * @param id - the memory to change.
    * @param patch - column values keyed by column name; an absent column is left untouched.
    * @param now - the new `updated_at`.
    * @returns the updated memory, or undefined when the id is unknown.
    */
   async update(id: string, patch: Readonly<Record<string, unknown>>, now: number): Promise<Memory | undefined> {
-    const entries = Object.entries(patch)
-    if (entries.length === 0) return this.get(id)
-    return this.serialize(async (connection) => {
-      const assignments = entries.map(([column], index) => `${column} = $${index + 1}`)
-      const statement = await connection.prepare(
-        `UPDATE memories SET ${assignments.join(', ')}, updated_at = $${entries.length + 1} `
-        + `WHERE id = $${entries.length + 2}`,
-      )
-      entries.forEach(([column, value], index) => {
-        MemoryStore.bindColumn(statement, index + 1, column, value)
-      })
-      statement.bindBigInt(entries.length + 1, BigInt(now))
-      statement.bindVarchar(entries.length + 2, id)
-      await statement.run()
-      return MemoryStore.one(await this.read(connection, id))
-    })
+    return this.serialize(async connection => new MemoryStatements(connection).update(id, patch, now))
   }
 
   /**
-   * Bind one patch value according to the column it targets.
-   * @param statement - the prepared update.
-   * @param index - the parameter position.
-   * @param column - the column being set, which decides the binding type.
-   * @param value - the value to bind.
-   */
-  private static bindColumn(
-    statement: DuckDBPreparedStatement, index: number, column: string, value: unknown,
-  ): void {
-    if (value === undefined || value === null) { statement.bindNull(index); return }
-    switch (column) {
-      case 'tags': case 'entities': case 'related_ids':
-        statement.bindList(index, value as string[], VARCHAR_LIST); return
-      case 'embedding':
-        statement.bindList(index, value as number[], FLOAT_LIST); return
-      case 'metadata':
-        statement.bindVarchar(index, JSON.stringify(value)); return
-      case 'priority': case 'access_count': case 'embedding_dim':
-        statement.bindInteger(index, value as number); return
-      case 'expires_at': case 'created_at':
-        statement.bindBigInt(index, BigInt(value as number)); return
-      default:
-        statement.bindVarchar(index, String(value))
-    }
-  }
-
-  /**
-   * Remove a memory and its audit trail permanently.
+   * Remove a memory and its audit trail permanently, as one transaction.
    * @param id - the memory to remove.
    * @returns true when a row was removed.
    */
   async hardDelete(id: string): Promise<boolean> {
-    return this.serialize(async (connection) => {
-      const statement = await connection.prepare('DELETE FROM memories WHERE id = $1 RETURNING id')
-      statement.bindVarchar(1, id)
-      const removed = (await statement.runAndReadAll()).getRowObjects().length > 0
-      if (removed) {
-        const trail = await connection.prepare('DELETE FROM provenance WHERE memory_id = $1')
-        trail.bindVarchar(1, id)
-        await trail.run()
-      }
-      return removed
-    })
+    return (await this.transaction(tx => tx.hardDelete(id))) !== undefined
   }
 
   /**
    * Read the project's complete rule set.
    *
    * Deliberately unlimited and unranked. Rules are enforced rather than recalled, so returning a
-   * top-N subset would mean an arbitrary rule silently stopped applying.
+   * top-N subset would mean an arbitrary rule silently stopped applying. Bounding what reaches the
+   * prompt is the renderer's job, and the renderer says what it left out.
    * @param now - the current time, for evaluating expiry.
    * @returns both halves, each ordered by priority then age.
    */
@@ -424,23 +373,28 @@ export class MemoryStore {
     terms: readonly string[], vector: readonly number[] | undefined, filters: CandidateFilters,
   ): Promise<CandidateSet> {
     return this.serialize(async (connection) => {
-      const extra: string[] = []
-      if (filters.category !== undefined) extra.push(`category = '${filters.category.replace(/'/g, "''")}'`)
-      const scope = `${LIVE.replace('?', '$1')}${extra.length === 0 ? '' : ` AND ${extra.join(' AND ')}`}`
+      // `$1` is the clock and `$2` the category (bound as NULL to mean "any"), in every probe below,
+      // so the scope is one parameterised fragment rather than a value spliced into SQL.
+      const scope = `${LIVE.replace('?', '$1')} AND (CAST($2 AS VARCHAR) IS NULL OR category = CAST($2 AS VARCHAR))`
+      const bindScope = (statement: DuckDBPreparedStatement): void => {
+        statement.bindBigInt(1, BigInt(filters.now))
+        if (filters.category === undefined) statement.bindNull(2)
+        else statement.bindVarchar(2, filters.category)
+      }
 
       const memories = new Map<string, Memory>()
       const cosine = new Map<string, number>()
       let truncated = false
 
       if (terms.length > 0) {
-        const probes = terms.map((_, index) => `contains(${HAYSTACK}, $${index + 2})`).join(' OR ')
+        const probes = terms.map((_, index) => `contains(${HAYSTACK}, $${index + 3})`).join(' OR ')
         const statement = await connection.prepare(
           `SELECT ${COLUMNS} FROM memories WHERE ${scope} AND (${probes}) `
-          + `ORDER BY updated_at DESC LIMIT $${terms.length + 2}`,
+          + `ORDER BY updated_at DESC LIMIT $${terms.length + 3}`,
         )
-        statement.bindBigInt(1, BigInt(filters.now))
-        terms.forEach((term, index) => { statement.bindVarchar(index + 2, term) })
-        statement.bindInteger(terms.length + 2, filters.limit)
+        bindScope(statement)
+        terms.forEach((term, index) => { statement.bindVarchar(index + 3, term) })
+        statement.bindInteger(terms.length + 3, filters.limit)
         const rows = (await statement.runAndReadAll()).getRowObjects()
         truncated ||= rows.length >= filters.limit
         for (const row of rows) {
@@ -451,13 +405,13 @@ export class MemoryStore {
 
       if (vector !== undefined && vector.length > 0) {
         const statement = await connection.prepare(
-          `SELECT ${COLUMNS}, list_cosine_similarity(embedding, $2) AS score FROM memories `
-          + `WHERE ${scope} AND embedding_dim = $3 ORDER BY score DESC LIMIT $4`,
+          `SELECT ${COLUMNS}, list_cosine_similarity(embedding, $3) AS score FROM memories `
+          + `WHERE ${scope} AND embedding_dim = $4 ORDER BY score DESC LIMIT $5`,
         )
-        statement.bindBigInt(1, BigInt(filters.now))
-        statement.bindList(2, [...vector], FLOAT_LIST)
-        statement.bindInteger(3, vector.length)
-        statement.bindInteger(4, filters.limit)
+        bindScope(statement)
+        statement.bindList(3, [...vector], FLOAT_LIST)
+        statement.bindInteger(4, vector.length)
+        statement.bindInteger(5, filters.limit)
         const rows = (await statement.runAndReadAll()).getRowObjects()
         truncated ||= rows.length >= filters.limit
         for (const row of rows) {
@@ -473,7 +427,7 @@ export class MemoryStore {
         + 'avg(length(content)) AS content, avg(length(array_to_string(tags, \' \'))) AS tags, '
         + `avg(length(array_to_string(entities, ' '))) AS entities FROM memories WHERE ${scope}`,
       )
-      statsStatement.bindBigInt(1, BigInt(filters.now))
+      bindScope(statsStatement)
       const [statsRow] = (await statsStatement.runAndReadAll()).getRowObjects()
 
       const averageLength = { title: 0, entities: 0, tags: 0, summary: 0, content: 0 }
@@ -542,27 +496,94 @@ export class MemoryStore {
   }
 
   /**
-   * Find live memories that carry no vector for the current model.
+   * Find live memories that carry no vector for the current embedding identity.
    *
    * A memory embedded by a previous model counts as missing: its vector cannot be compared with a
-   * new query vector, so leaving it would make it permanently invisible to semantic search.
-   * @param model - the model currently configured.
+   * new query vector, so leaving it would make it permanently invisible to semantic search. So does
+   * one embedded by the same model name at a different dimension — a provider reconfigured with a
+   * new `dimensions` keeps its name, and the candidate probe excludes the old vectors by length.
+   * @param identity - the model name, and the dimension when it is known.
    * @param limit - most rows to return.
    * @param now - the current time, for evaluating expiry.
    * @returns the memories needing an embedding, oldest first so a backlog drains in order.
    */
-  async withoutEmbedding(model: string, limit: number, now: number): Promise<Memory[]> {
+  async withoutEmbedding(identity: EmbeddingIdentity, limit: number, now: number): Promise<Memory[]> {
     return this.serialize(async (connection) => {
       const statement = await connection.prepare(
-        `SELECT ${COLUMNS} FROM memories WHERE ${LIVE.replace('?', '$1')} `
-        + 'AND (embedding IS NULL OR embedding_model IS DISTINCT FROM $2) '
-        + 'ORDER BY created_at ASC LIMIT $3',
+        `SELECT ${COLUMNS} FROM memories WHERE ${LIVE.replace('?', '$1')} AND ${MemoryStore.stale(identity, 3)} `
+        + 'ORDER BY created_at ASC LIMIT $2',
+      )
+      statement.bindBigInt(1, BigInt(now))
+      statement.bindInteger(2, limit)
+      MemoryStore.bindIdentity(statement, identity, 3)
+      return (await statement.runAndReadAll()).getRowObjects().map(toMemory)
+    })
+  }
+
+  /**
+   * Count live memories that carry no vector for the current embedding identity.
+   * @param identity - the model name and, when known, the dimension; undefined counts every live
+   *   memory with no vector at all.
+   * @param now - the current time, for evaluating expiry.
+   * @returns how many still need an embedding.
+   */
+  async countWithoutEmbedding(identity: EmbeddingIdentity | undefined, now: number): Promise<number> {
+    return this.serialize(async (connection) => {
+      const predicate = identity === undefined ? 'embedding IS NULL' : MemoryStore.stale(identity, 2)
+      const statement = await connection.prepare(
+        `SELECT count(*) AS n FROM memories WHERE ${LIVE.replace('?', '$1')} AND ${predicate}`,
+      )
+      statement.bindBigInt(1, BigInt(now))
+      if (identity !== undefined) MemoryStore.bindIdentity(statement, identity, 2)
+      const [row] = (await statement.runAndReadAll()).getRowObjects()
+      return Number(row?.['n'] ?? 0)
+    })
+  }
+
+  /**
+   * Read the oldest live memory already embedded by a model, whatever its dimension.
+   *
+   * Used to learn what dimension a provider emits today without spending a call on throwaway text:
+   * re-embedding this memory both answers the question and refreshes its vector.
+   * @param model - the model name.
+   * @param now - the current time, for evaluating expiry.
+   * @returns the memory, or undefined when the model has embedded nothing live.
+   */
+  async embeddedBy(model: string, now: number): Promise<Memory | undefined> {
+    return this.serialize(async (connection) => {
+      const statement = await connection.prepare(
+        `SELECT ${COLUMNS} FROM memories WHERE ${LIVE.replace('?', '$1')} AND embedding IS NOT NULL `
+        + 'AND embedding_model = $2 ORDER BY created_at ASC LIMIT 1',
       )
       statement.bindBigInt(1, BigInt(now))
       statement.bindVarchar(2, model)
-      statement.bindInteger(3, limit)
-      return (await statement.runAndReadAll()).getRowObjects().map(toMemory)
+      const [row] = (await statement.runAndReadAll()).getRowObjects()
+      return row === undefined ? undefined : toMemory(row)
     })
+  }
+
+  /**
+   * The predicate for "no usable vector for this identity". Two spellings rather than a nullable
+   * dimension parameter, because DuckDB cannot infer the type of a parameter only ever compared with
+   * NULL; {@link bindIdentity} binds whichever parameters the spelling uses.
+   * @param identity - the model name and optional dimension.
+   * @param first - the parameter position of the model; the dimension, when known, takes the next.
+   * @returns the SQL fragment.
+   */
+  private static stale(identity: EmbeddingIdentity, first: number): string {
+    const dimension = identity.dimensions === undefined ? '' : ` OR embedding_dim IS DISTINCT FROM $${first + 1}`
+    return `(embedding IS NULL OR embedding_model IS DISTINCT FROM $${first}${dimension})`
+  }
+
+  /**
+   * Bind the parameters {@link stale} placed.
+   * @param statement - the prepared statement.
+   * @param identity - the model name and optional dimension.
+   * @param first - the parameter position of the model.
+   */
+  private static bindIdentity(statement: DuckDBPreparedStatement, identity: EmbeddingIdentity, first: number): void {
+    statement.bindVarchar(first, identity.model)
+    if (identity.dimensions !== undefined) statement.bindInteger(first + 1, identity.dimensions)
   }
 
   /**
@@ -624,18 +645,7 @@ export class MemoryStore {
    * @param entry - what happened to which memory, and when.
    */
   async recordProvenance(entry: Omit<ProvenanceEntry, 'seq'>): Promise<void> {
-    await this.serialize(async (connection) => {
-      const statement = await connection.prepare(
-        'INSERT INTO provenance (memory_id, operation, details, actor, recorded_at) VALUES ($1,$2,$3,$4,$5)',
-      )
-      statement.bindVarchar(1, entry.memoryId)
-      statement.bindVarchar(2, entry.operation)
-      if (entry.details === undefined) statement.bindNull(3)
-      else statement.bindVarchar(3, JSON.stringify(entry.details))
-      statement.bindVarchar(4, entry.actor)
-      statement.bindBigInt(5, BigInt(entry.at))
-      await statement.run()
-    })
+    await this.serialize(async connection => new MemoryStatements(connection).recordProvenance(entry))
   }
 
   /**
@@ -671,7 +681,10 @@ export class MemoryStore {
   }
 
   /**
-   * Close a session record with its summary.
+   * Close an open session record with its summary.
+   *
+   * A session that already ended is left alone: its summary is what the next session opened with,
+   * and letting a later call overwrite it would let any caller holding an old id rewrite history.
    * @param id - the session to close.
    * @param summary - what the next session needs to know.
    * @param created - memories written during the session.
@@ -685,7 +698,7 @@ export class MemoryStore {
     return this.serialize(async (connection) => {
       const statement = await connection.prepare(
         'UPDATE sessions SET ended_at = $1, summary = $2, memories_created = $3, '
-        + 'memories_accessed = $4 WHERE id = $5 RETURNING id',
+        + 'memories_accessed = $4 WHERE id = $5 AND ended_at IS NULL RETURNING id',
       )
       statement.bindBigInt(1, BigInt(now))
       statement.bindVarchar(2, summary)
@@ -701,15 +714,19 @@ export class MemoryStore {
    * open forever and shadow the last real summary.
    * @param summary - the marker text recorded on each, recognisable when reading the summary back.
    * @param now - the close time.
+   * @param live - sessions an agent in this process still owns, which are open because they are in
+   *   use rather than abandoned.
    * @returns how many were closed.
    */
-  async closeOrphans(summary: string, now: number): Promise<number> {
+  async closeOrphans(summary: string, now: number, live: readonly string[] = []): Promise<number> {
     return this.serialize(async (connection) => {
       const statement = await connection.prepare(
-        'UPDATE sessions SET ended_at = $1, summary = $2 WHERE ended_at IS NULL RETURNING id',
+        'UPDATE sessions SET ended_at = $1, summary = $2 WHERE ended_at IS NULL '
+        + 'AND NOT list_contains($3, id) RETURNING id',
       )
       statement.bindBigInt(1, BigInt(now))
       statement.bindVarchar(2, summary)
+      statement.bindList(3, [...live], VARCHAR_LIST)
       return (await statement.runAndReadAll()).getRowObjects().length
     })
   }
@@ -757,6 +774,203 @@ export class MemoryStore {
       const result = await connection.runAndReadAll(`SELECT ${COLUMNS} FROM memories ORDER BY created_at ASC`)
       return result.getRowObjects().map(toMemory)
     })
+  }
+}
+
+/** What a stored vector is stamped with, and compared against to decide it must be redone. */
+export interface EmbeddingIdentity {
+  /** The model name the provider reports. */
+  readonly model: string
+  /** The vector length it emits, when known; unknown matches any stored length. */
+  readonly dimensions?: number
+}
+
+/** The statements a composite write may run inside {@link MemoryStore.transaction}. */
+export type MemoryTransaction = Pick<
+  MemoryStatements, 'read' | 'insert' | 'update' | 'recordProvenance' | 'hardDelete' | 'countLiveRules'
+>
+
+/**
+ * Single-row statements over a connection the caller already holds.
+ *
+ * Shared by the store's own serialized methods and by transactions, so a write issued alone and the
+ * same write issued as part of a larger unit are one piece of SQL rather than two that can drift.
+ */
+class MemoryStatements {
+  #revoked = false
+
+  /**
+   * @param connection - a connection the caller has exclusive use of.
+   */
+  constructor(private readonly connection: DuckDBConnection) {}
+
+  /** Refuse further use once the unit of work that owned the connection has ended. */
+  revoke(): void {
+    this.#revoked = true
+  }
+
+  /**
+   * The connection, while this handle is still valid.
+   * @returns the connection.
+   * @throws MemoryStoreError when the owning transaction has already settled.
+   */
+  private get held(): DuckDBConnection {
+    if (this.#revoked) throw new MemoryStoreError('a memory transaction handle was used after its transaction ended')
+    return this.connection
+  }
+
+  /**
+   * Read one memory by identity.
+   * @param id - the memory id.
+   * @returns the memory, or undefined when the project does not hold it.
+   */
+  async read(id: string): Promise<Memory | undefined> {
+    const statement = await this.held.prepare(`SELECT ${COLUMNS} FROM memories WHERE id = $1`)
+    statement.bindVarchar(1, id)
+    const [row] = (await statement.runAndReadAll()).getRowObjects()
+    return row === undefined ? undefined : toMemory(row)
+  }
+
+  /**
+   * Write a new memory.
+   * @param memory - the complete row to insert.
+   * @returns the stored memory as it reads back.
+   */
+  async insert(memory: StoredMemory): Promise<Memory> {
+    const statement = await this.held.prepare(
+      'INSERT INTO memories (id, category, title, content, summary, tags, entities, related_ids, '
+      + 'metadata, status, priority, source, expires_at, created_at, updated_at) '
+      + 'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)',
+    )
+    MemoryStatements.bindMemory(statement, memory)
+    await statement.run()
+    return (await this.read(memory.id)) as Memory
+  }
+
+  /**
+   * Apply a patch to one memory.
+   * @param id - the memory to change.
+   * @param patch - column values keyed by column name; an absent column is left untouched.
+   * @param now - the new `updated_at`.
+   * @returns the updated memory, or undefined when the id is unknown.
+   */
+  async update(id: string, patch: Readonly<Record<string, unknown>>, now: number): Promise<Memory | undefined> {
+    const entries = Object.entries(patch)
+    if (entries.length === 0) return this.read(id)
+    const assignments = entries.map(([column], index) => `${column} = $${index + 1}`)
+    const statement = await this.held.prepare(
+      `UPDATE memories SET ${assignments.join(', ')}, updated_at = $${entries.length + 1} `
+      + `WHERE id = $${entries.length + 2}`,
+    )
+    entries.forEach(([column, value], index) => {
+      MemoryStatements.bindColumn(statement, index + 1, column, value)
+    })
+    statement.bindBigInt(entries.length + 1, BigInt(now))
+    statement.bindVarchar(entries.length + 2, id)
+    await statement.run()
+    return this.read(id)
+  }
+
+  /**
+   * Remove a memory and its audit trail. Two statements: run it inside a transaction.
+   * @param id - the memory to remove.
+   * @returns the memory as it was, or undefined when no row was removed.
+   */
+  async hardDelete(id: string): Promise<Memory | undefined> {
+    const existing = await this.read(id)
+    if (existing === undefined) return undefined
+    const statement = await this.held.prepare('DELETE FROM memories WHERE id = $1')
+    statement.bindVarchar(1, id)
+    await statement.run()
+    const trail = await this.held.prepare('DELETE FROM provenance WHERE memory_id = $1')
+    trail.bindVarchar(1, id)
+    await trail.run()
+    return existing
+  }
+
+  /**
+   * Append one audit entry.
+   * @param entry - what happened to which memory, and when.
+   */
+  async recordProvenance(entry: Omit<ProvenanceEntry, 'seq'>): Promise<void> {
+    const statement = await this.held.prepare(
+      'INSERT INTO provenance (memory_id, operation, details, actor, recorded_at) VALUES ($1,$2,$3,$4,$5)',
+    )
+    statement.bindVarchar(1, entry.memoryId)
+    statement.bindVarchar(2, entry.operation)
+    if (entry.details === undefined) statement.bindNull(3)
+    else statement.bindVarchar(3, JSON.stringify(entry.details))
+    statement.bindVarchar(4, entry.actor)
+    statement.bindBigInt(5, BigInt(entry.at))
+    await statement.run()
+  }
+
+  /**
+   * Count live rules written under one source label.
+   * @param source - the source label to count.
+   * @param now - the current time, for evaluating expiry.
+   * @returns how many live rules carry that source.
+   */
+  async countLiveRules(source: string, now: number): Promise<number> {
+    const statement = await this.held.prepare(
+      `SELECT count(*) AS n FROM memories WHERE category IN (${RULE_IN}) AND source = $1 AND ${LIVE.replace('?', '$2')}`,
+    )
+    statement.bindVarchar(1, source)
+    statement.bindBigInt(2, BigInt(now))
+    const [row] = (await statement.runAndReadAll()).getRowObjects()
+    return Number(row?.['n'] ?? 0)
+  }
+
+  /**
+   * Bind a memory's columns onto a prepared insert.
+   * @param statement - the prepared statement, whose first 15 parameters are the column list.
+   * @param memory - the values to bind.
+   */
+  private static bindMemory(statement: DuckDBPreparedStatement, memory: StoredMemory): void {
+    statement.bindVarchar(1, memory.id)
+    statement.bindVarchar(2, memory.category)
+    statement.bindVarchar(3, memory.title)
+    statement.bindVarchar(4, memory.content)
+    statement.bindVarchar(5, memory.summary)
+    statement.bindList(6, [...memory.tags], VARCHAR_LIST)
+    statement.bindList(7, [...memory.entities], VARCHAR_LIST)
+    statement.bindList(8, [...memory.relatedIds], VARCHAR_LIST)
+    if (memory.metadata === undefined) statement.bindNull(9)
+    else statement.bindVarchar(9, JSON.stringify(memory.metadata))
+    statement.bindVarchar(10, memory.status)
+    statement.bindInteger(11, memory.priority)
+    statement.bindVarchar(12, memory.source)
+    if (memory.expiresAt === undefined) statement.bindNull(13)
+    else statement.bindBigInt(13, BigInt(memory.expiresAt))
+    statement.bindBigInt(14, BigInt(memory.createdAt))
+    statement.bindBigInt(15, BigInt(memory.updatedAt))
+  }
+
+  /**
+   * Bind one patch value according to the column it targets.
+   * @param statement - the prepared update.
+   * @param index - the parameter position.
+   * @param column - the column being set, which decides the binding type.
+   * @param value - the value to bind.
+   */
+  private static bindColumn(
+    statement: DuckDBPreparedStatement, index: number, column: string, value: unknown,
+  ): void {
+    if (value === undefined || value === null) { statement.bindNull(index); return }
+    switch (column) {
+      case 'tags': case 'entities': case 'related_ids':
+        statement.bindList(index, value as string[], VARCHAR_LIST); return
+      case 'embedding':
+        statement.bindList(index, value as number[], FLOAT_LIST); return
+      case 'metadata':
+        statement.bindVarchar(index, JSON.stringify(value)); return
+      case 'priority': case 'access_count': case 'embedding_dim':
+        statement.bindInteger(index, value as number); return
+      case 'expires_at': case 'created_at':
+        statement.bindBigInt(index, BigInt(value as number)); return
+      default:
+        statement.bindVarchar(index, String(value))
+    }
   }
 }
 

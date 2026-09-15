@@ -1,17 +1,24 @@
 /**
  * The one definition of what the vendored Typert artifact is generated FROM.
  *
- * `generated/` is produced by the harness's Typert generator, which only runs inside a
- * deepseek-harness checkout. That makes it a build output this package cannot rebuild on its own, so
- * it is committed — and a committed build output rots silently unless something watches its inputs.
- * The fingerprint is that watch: any edit to the Host surface invalidates it.
+ * `generated/` is rendered by `typert-emit.mjs` from a hand-maintained endpoint table, because the
+ * harness's own Typert generator only runs inside a deepseek-harness checkout. It is committed, and a
+ * committed output of a hand-maintained input rots silently unless something watches both. The
+ * fingerprint is that watch: any edit to the Host surface or to the table invalidates it, and only
+ * `regen-typert.mjs` — run on purpose — records a new one.
  */
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 
-/** Sources the generator reads: the `@Remote` methods and every type they name. */
-export const TYPERT_INPUTS = ['src/host/index.ts', 'src/host/types.ts']
+/**
+ * Everything `generated/` is a function of: the `@Remote` methods and every type they name, the
+ * endpoint table the artifact is rendered from, and the renderer itself. Leaving the table out would
+ * let it drift from the Host surface — or be edited without regenerating — with the check still green.
+ */
+export const TYPERT_INPUTS = [
+  'src/host/index.ts', 'src/host/types.ts', 'scripts/typert-endpoints.mjs', 'scripts/typert-emit.mjs',
+]
 
 /** Where the recorded fingerprint lives. */
 export const FINGERPRINT_FILE = 'generated/.fingerprint'

@@ -22,18 +22,23 @@ import z from '@deepseek-ai/schemastery'
 import { installSettingsSection, settingsNamespace } from './settings-section.ts'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import { MemoryStore } from './store.ts'
 import { ProjectMemory, type Embedder, type ProjectMemoryOptions } from './memory.ts'
 import { DEFAULT_DATABASE_PATH, MemoryStoreError, canonicalDatabasePath, resolveDatabasePath } from './db.ts'
+import { isSubagentSession } from './lineage.ts'
 import { toCategoryCounts, toMemoryView, toProvenanceView, toSessionView } from './views.ts'
 import { parseInstructions } from './import.ts'
 import { DEFAULT_RELEVANCE_WEIGHTS } from '../domain/score.ts'
-import { renderSessionContext, renderSessionEndReminder } from '../domain/rules.ts'
-import { MemoryInputError, MemoryNotFoundError, parseCreate, parseUpdate } from '../domain/validate.ts'
-import { MEMORY_CATEGORIES, type MemoryCategory } from '../domain/types.ts'
-import type { EmbeddingProviderInfo } from '../embedding/index.ts'
-import type {} from '../embedding/index.ts'
+import {
+  PROMPT_LITERAL_BRACES, escapePromptText, renderSessionContext, renderSessionEndReminder,
+} from '../domain/rules.ts'
+import { MemoryForbiddenError } from '../domain/authorship.ts'
+import {
+  IMPORT_ENTRY_LIMIT, MemoryInputError, MemoryNotFoundError, parseCreate, parseImport, parseListQuery,
+  parseSearchQuery, parseUpdate,
+} from '../domain/validate.ts'
+import { MEMORY_CATEGORIES, type CreateMemoryInput, type MemoryCategory } from '../domain/types.ts'
+import type { EmbeddingEngine, EmbeddingProviderInfo } from '../embedding/index.ts'
 import type {
   MemoryCreateRequest, MemoryEmbedResult, MemoryExportResult, MemoryImportRequest,
   MemoryImportResult, MemoryListRequest, MemoryListResult, MemoryOverviewResult,
@@ -92,6 +97,9 @@ const EXPORT_VERSION = 1
  */
 function failure(error: unknown): { readonly ok: false, readonly code: 'invalid' | 'not-found' | 'unavailable', readonly message: string } {
   if (error instanceof MemoryInputError) return { ok: false, code: 'invalid', message: error.message }
+  // The manager writes as the user, who is never refused on authorship; mapped anyway so a refusal
+  // reaching an endpoint is a readable rejection rather than a transport fault.
+  if (error instanceof MemoryForbiddenError) return { ok: false, code: 'invalid', message: error.message }
   if (error instanceof MemoryNotFoundError) return { ok: false, code: 'not-found', message: error.message }
   if (error instanceof MemoryStoreError) return { ok: false, code: 'unavailable', message: error.message }
   throw error
@@ -117,6 +125,30 @@ function parseSidecar(json: string | undefined): Record<string, unknown> | null 
   }
   return parsed as Record<string, unknown>
 }
+
+/**
+ * A live agent, as the `agents` service and the agent events hand it over.
+ *
+ * Derived from the service rather than imported from `@deepseek-ai/dsh-agent` by name, so the type
+ * is always the one the running harness declares — a linked development checkout and the installed
+ * release can otherwise disagree about it.
+ */
+type Agent = ReturnType<Context['agents']['list']>[number]
+
+/** One agent's tie to the project whose rules bind it. */
+interface AgentBinding {
+  /** The directory the agent's session works in; re-resolved when the database path changes. */
+  readonly cwd: string
+  /** Whether the agent is a delegated subagent, which gets rules but no memory session. */
+  readonly subagent: boolean
+  /** The project the agent is bound to right now; replaced when its cwd resolves to another file. */
+  project: ProjectMemory
+  /** The agent-scoped registration of the rule section, disposed with the agent. */
+  fiber?: ReturnType<Context['inject']>
+}
+
+/** Why an agent is being bound: its session just started, or it was running before this plugin was. */
+type BindReason = 'session-start' | 'already-running'
 
 /** Host-side memory endpoint, settings owner, and harness-hook consumer. */
 export class MemoryService extends TypertRemoteService {
@@ -147,14 +179,24 @@ export class MemoryService extends TypertRemoteService {
   // private field is keyed to the instance that declared it — so a Remote call arriving through
   // `ctx.memory` cannot read one, and every endpoint fails with a brand-check error at runtime that
   // no type check can see.
-  /** Open memories keyed by canonical database path; a project is opened on first touch. */
+  /** Projects keyed by canonical database path, including ones still opening; opened on first touch. */
   private readonly projects = new Map<string, Promise<ProjectMemory>>()
-  /** Per-agent prompt fibers, so a rule set unwinds with the agent that reads it. */
-  private readonly promptFibers = new Map<Agent, ReturnType<Context['inject']>>()
+  /** Projects that finished opening, for the synchronous prompt path that cannot await an open. */
+  private readonly opened = new Map<string, ProjectMemory>()
+  /** Canonical database path per project root and configured path, so assembly does no disk I/O. */
+  private readonly keys = new Map<string, string>()
+  /** Every agent this instance has bound, from the moment binding begins. */
+  private readonly attached = new Set<Agent>()
+  /** The bound agents' projects and rule sections. */
+  private readonly bindings = new Map<Agent, AgentBinding>()
   /** Agents that have already been reminded to file a summary, under the `once` policy. */
   private readonly reminded = new WeakSet<Agent>()
-  /** The mounted embedding provider's model name, refreshed whenever its readiness is described. */
-  private embeddingModel: string | undefined
+  /** The mounted provider as {@link ProjectMemory} consumes it, once its identity is known. */
+  private embedder: Promise<Embedder | undefined> = Promise.resolve(undefined)
+  /** Bumped on every provider mount and unmount, so a slow describe() cannot attach a stale one. */
+  private embedderGeneration = 0
+  /** The database path open projects were resolved under, to notice when a settings change moves it. */
+  private appliedDatabasePath: string
   private source: () => Config
 
   /**
@@ -165,30 +207,45 @@ export class MemoryService extends TypertRemoteService {
   constructor(ctx: Context, config: Config) {
     super(ctx, 'memory')
     this.source = () => config
+    this.appliedDatabasePath = config.databasePath
     installSettingsSection(ctx, MEMORY_SETTINGS_NAMESPACE, MemoryService.Config, config, {
       setSource: (current) => { this.source = current },
-      // Ranking and injection settings are read inside each call and each prompt assembly, so a
-      // committed change reaches the next request with no registration to rebuild. The one derived
-      // thing — an already-open project's options — is refreshed here.
+      // Ranking, retention, and injection settings are read inside each call and each prompt
+      // assembly — open projects read them through a function — so a committed change reaches the
+      // next request with nothing to rebuild. A moved database is the one change that re-resolves
+      // projects, and that happens here.
       onChange: () => { this.applySettings() },
     })
 
-    ctx.on('agent/session-start', ({ agent }) => { this.onSessionStart(agent) })
+    ctx.on('agent/session-start', ({ agent }) => { this.bind(agent, 'session-start') })
     ctx.on('agent/turn-stopping', ({ agent }) => { this.onTurnStopping(agent) })
     ctx.on('agent/disposed', ({ agent }) => { this.onAgentDisposed(agent) })
 
+    // A provider can mount after projects are open, go away, or be reconfigured (which remounts it),
+    // so attachment follows its lifecycle rather than being decided once at project open.
+    ctx.inject(['memoryEmbedding'], (scope) => {
+      this.useEmbeddingEngine(scope.memoryEmbedding)
+      scope.effect(() => () => { this.useEmbeddingEngine(undefined) }, 'dsh-memory: detach embedding provider')
+    })
+
     ctx.effect(() => async () => {
-      const fibers = [...this.promptFibers.values()]
-      this.promptFibers.clear()
-      await Promise.all(fibers.map(fiber => fiber.dispose()))
+      const bindings = [...this.bindings.values()]
+      this.bindings.clear()
+      this.attached.clear()
+      await Promise.all(bindings.map(binding => binding.fiber?.dispose()))
       const projects = [...this.projects.values()]
       this.projects.clear()
+      this.opened.clear()
       await Promise.all(projects.map(async (pending) => {
         // A project still opening must finish before it can be closed; a project that FAILED to open
         // holds no database, so there is nothing to release and the rejection is already reported.
         await pending.then(project => project.close(), () => {})
       }))
     }, 'dsh-memory: close project memories')
+
+    // A reloaded plugin starts after its agents did: their session-start has already fired, and
+    // without this they would run on with no rule section at all until their next session.
+    for (const agent of ctx.agents.list()) this.bind(agent, 'already-running')
   }
 
   // ---------- project resolution ----------
@@ -211,7 +268,8 @@ export class MemoryService extends TypertRemoteService {
     const retention: Partial<Record<MemoryCategory, number | null>> = {}
     for (const [category, days] of Object.entries(config.retentionDays ?? {})) {
       if (!(MEMORY_CATEGORIES as readonly string[]).includes(category)) continue
-      // Zero is how a numeric setting says "never", since the schema has no null to offer.
+      // Zero is how a numeric setting says "never", since the schema has no null to offer; `null` is
+      // how the retention table says it.
       retention[category as MemoryCategory] = days === 0 ? null : days
     }
     return {
@@ -227,6 +285,24 @@ export class MemoryService extends TypertRemoteService {
   }
 
   /**
+   * The canonical database path a project root resolves to under the current configuration.
+   *
+   * Cached, because the prompt path calls this on every assembly and canonicalising touches the disk.
+   * @param root - absolute project directory.
+   * @returns the canonical path, the key a project is opened under.
+   * @throws Error when the database directory cannot be created or resolved.
+   */
+  private keyFor(root: string): string {
+    const configured = this.source().databasePath
+    const cacheKey = `${root}\u0000${configured}`
+    const cached = this.keys.get(cacheKey)
+    if (cached !== undefined) return cached
+    const key = canonicalDatabasePath(resolveDatabasePath(root, configured))
+    this.keys.set(cacheKey, key)
+    return key
+  }
+
+  /**
    * Open a project's memory, or return the already-open one.
    *
    * A failed open is not cached: the usual cause is another process holding the file lock, and a
@@ -237,25 +313,39 @@ export class MemoryService extends TypertRemoteService {
    */
   async project(projectRoot?: string): Promise<ProjectMemory> {
     const root = projectRoot ?? this.defaultRoot
-    const options = this.optionsFor(root)
     // Keyed by the file, not by the string a caller named the project with: the session's cwd and
     // the browser's workspace root can spell one directory differently, and two ProjectMemory objects
-    // over one database would each hold their own rule cache and session.
+    // over one database would each hold their own rule cache and sessions.
     let key: string
     try {
-      key = canonicalDatabasePath(options.databasePath)
+      key = this.keyFor(root)
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      throw new MemoryStoreError(`could not open the memory database at "${options.databasePath}": ${message}`)
+      const path = resolveDatabasePath(root, this.source().databasePath)
+      throw new MemoryStoreError(`could not open the memory database at "${path}": ${message}`)
     }
     const existing = this.projects.get(key)
     if (existing !== undefined) return existing
     const opening = (async () => {
       const store = await MemoryStore.open(key)
-      const project = new ProjectMemory(store, { ...options, databasePath: key })
-      project.setEmbedder(this.embedder())
-      await project.refreshRules(Date.now())
-      return project
+      // Options are read per call, so a settings change reaches this project without reopening it.
+      const project = new ProjectMemory(store, () => ({ ...this.optionsFor(root), databasePath: key }))
+      try {
+        await project.refreshRules(Date.now())
+        // Visible to the synchronous prompt path only once its rule cache is filled, so an agent
+        // re-bound to it never reads an empty block in between.
+        this.opened.set(key, project)
+        const pending = this.embedder
+        const embedder = await pending
+        // A provider that mounted or went away during the wait has already been applied to every
+        // opened project, this one included; applying the older answer now would undo it.
+        if (pending === this.embedder) project.setEmbedder(embedder)
+        return project
+      } catch (error) {
+        if (this.opened.get(key) === project) this.opened.delete(key)
+        await project.close()
+        throw error
+      }
     })()
     this.projects.set(key, opening)
     opening.catch(() => { if (this.projects.get(key) === opening) this.projects.delete(key) })
@@ -263,22 +353,49 @@ export class MemoryService extends TypertRemoteService {
   }
 
   /**
-   * The embedding provider, as {@link ProjectMemory} consumes it.
-   * @returns the embedder, or undefined when no provider is mounted.
+   * Attach a provider to every open project, or detach the one that went away.
+   *
+   * The identity vectors are stamped with is resolved BEFORE anything is embedded. Stamping a
+   * placeholder and correcting it once the provider described itself made every restart re-embed the
+   * whole project, because the stored stamp no longer matched the corrected one.
+   * @param engine - the mounted provider, or undefined when it unmounted.
    */
-  private embedder(): Embedder | undefined {
-    const engine = this.ctx.get('memoryEmbedding')
-    if (engine === undefined) return undefined
+  private useEmbeddingEngine(engine: EmbeddingEngine | undefined): void {
+    this.embedderGeneration += 1
+    const generation = this.embedderGeneration
+    const resolving = engine === undefined ? Promise.resolve(undefined) : this.identify(engine)
+    this.embedder = resolving
+    void resolving.then((embedder) => {
+      if (generation !== this.embedderGeneration) return
+      for (const project of this.opened.values()) project.setEmbedder(embedder)
+    }).catch((error: unknown) => {
+      this.ctx.logger.warn(`dsh-memory: could not attach the embedding provider: ${String(error)}`)
+    })
+  }
+
+  /**
+   * Learn a provider's model and dimension, and wrap it as {@link ProjectMemory} consumes it.
+   * @param engine - the mounted provider.
+   * @returns the embedder, or undefined when the provider cannot describe itself — attaching it under
+   *   a guessed identity would mis-stamp every vector it produced.
+   */
+  private async identify(engine: EmbeddingEngine): Promise<Embedder | undefined> {
+    let info: EmbeddingProviderInfo
+    try {
+      info = await engine.describe()
+    } catch (error) {
+      this.ctx.logger.warn(`dsh-memory: the embedding provider could not describe itself; ranking lexically: ${String(error)}`)
+      return undefined
+    }
     return {
-      // The provider's own identity is what a stored vector is stamped with; asking it per batch
-      // would make every backfill wait on a describe() round trip.
-      model: this.embeddingModel ?? 'unknown',
+      model: info.model ?? info.provider,
+      ...info.dimensions === undefined ? {} : { dimensions: info.dimensions },
       embed: (texts, signal) => engine.embed(texts, signal),
     }
   }
 
   /**
-   * Describe the mounted embedding provider, and remember its model for vector stamping.
+   * Describe the mounted embedding provider, for the manager's header.
    * @returns the provider's readiness, or an absent provider.
    */
   private async describeEmbedding(): Promise<EmbeddingProviderInfo & { available: boolean }> {
@@ -286,38 +403,75 @@ export class MemoryService extends TypertRemoteService {
     if (engine === undefined) {
       return { available: false, provider: 'none', ready: false, detail: 'no embedding provider is mounted' }
     }
-    const info = await engine.describe()
-    this.embeddingModel = info.model ?? info.provider
-    return { ...info, available: true }
+    return { ...await engine.describe(), available: true }
   }
 
-  /** Re-apply changed settings to every already-open project. */
+  /** React to a committed settings change: only a moved database needs more than the next read. */
   private applySettings(): void {
-    for (const pending of this.projects.values()) {
-      void pending.then((project) => { project.setEmbedder(this.embedder()) }, () => {})
+    const databasePath = this.source().databasePath
+    if (databasePath === this.appliedDatabasePath) return
+    this.appliedDatabasePath = databasePath
+    void this.moveProjects().catch((error: unknown) => {
+      this.ctx.logger.warn(`dsh-memory: could not move to the new database path: ${String(error)}`)
+    })
+  }
+
+  /**
+   * Re-resolve every live agent's project after the database path changed, then release the files
+   * nothing reaches any more.
+   *
+   * Tools resolve their project per call, so without this they would write the new file while each
+   * live agent's rule section kept reading the old one — two halves of one agent disagreeing about
+   * which rules exist.
+   */
+  private async moveProjects(): Promise<void> {
+    const config = this.source()
+    for (const [agent, binding] of [...this.bindings]) {
+      const next = await this.project(binding.cwd)
+      if (next === binding.project) continue
+      binding.project.releaseSession(agent.id)
+      binding.project = next
+      if (!binding.subagent && config.autoSession) await next.startSession(Date.now(), agent.id)
     }
+    const stale = [...this.opened].filter(([key, project]) => this.keyFor(project.projectRoot) !== key)
+    for (const [key] of stale) {
+      this.opened.delete(key)
+      this.projects.delete(key)
+    }
+    await Promise.all(stale.map(([, project]) => project.close()))
   }
 
   // ---------- harness hooks ----------
 
   /**
-   * Open the agent's project, install its rule section, and seed its opening context.
+   * Bind an agent to its project: install its rule section, and — for a top-level agent — open its
+   * memory session and seed its opening context.
    *
-   * Everything here is detached. `agent/session-start` is a notification the loop does not await, so
-   * a slow first database open must not delay the first request — the rule section reads the cached
-   * block, which is empty until the open completes and correct on every request after it.
-   * @param agent - the agent whose session began.
+   * Everything past the synchronous guard is detached. `agent/session-start` is a notification the
+   * loop does not await, so a slow first database open must not delay the first request — the rule
+   * section reads the cached block, which is correct from the moment the open completes.
+   *
+   * A subagent gets the rules and nothing else. It works in its parent's directory and fires its own
+   * session-start, but it is not a new session of the project: starting a memory session for it
+   * would replace nothing of its own and would compete with its parent's, and re-sending the
+   * project history spends its context on what its brief already carries.
+   * @param agent - the agent to bind.
+   * @param reason - a fresh session gets its opening context; an agent that was already running when
+   *   this plugin started has had it, and gets only its rules and a session to file against.
    */
-  private onSessionStart(agent: Agent): void {
+  private bind(agent: Agent, reason: BindReason): void {
     const cwd = agent.session.header.cwd
-    if (cwd === undefined) return
+    if (cwd === undefined || this.attached.has(agent)) return
+    this.attached.add(agent)
+    const subagent = isSubagentSession(agent.session.header)
     const config = this.source()
     void (async () => {
       const project = await this.project(cwd)
-      if (config.injectRules) this.installRules(agent, project)
-      if (!config.autoSession) return
-      const context = await project.startSession(Date.now())
-      if (!config.injectSessionContext) return
+      if (!this.attached.has(agent)) return
+      this.installRules(agent, { cwd, subagent, project })
+      if (subagent || !config.autoSession) return
+      const context = await project.startSession(Date.now(), agent.id)
+      if (reason === 'already-running' || !config.injectSessionContext) return
       const text = renderSessionContext(context)
       if (text.length === 0) return
       agent.inject(createUserMessage({
@@ -335,62 +489,105 @@ export class MemoryService extends TypertRemoteService {
    * Agent-scoped rather than global because two workspaces open in one Host have different rules,
    * and a global section would hand each agent the other's. The provider re-reads the cached block
    * at every assembly, which is what keeps a mid-session rule edit binding from the next request.
+   *
+   * The literal-brace variable is registered beside the section because the section's text is
+   * escaped against it; the renderer resolves variables from the same scope chain, so the two cannot
+   * be separated.
    * @param agent - the agent to bind.
-   * @param project - the memory whose rules bind it.
+   * @param binding - its directory, lineage, and project.
    */
-  private installRules(agent: Agent, project: ProjectMemory): void {
-    if (this.promptFibers.has(agent)) return
-    const fiber = agent.ctx.inject(['systemPrompt'], (scope) => {
+  private installRules(agent: Agent, binding: AgentBinding): void {
+    if (this.bindings.has(agent)) return
+    this.bindings.set(agent, binding)
+    binding.fiber = agent.ctx.inject(['systemPrompt'], (scope) => {
+      scope.systemPrompt.variable(PROMPT_LITERAL_BRACES.name, () => PROMPT_LITERAL_BRACES.value)
       scope.systemPrompt.section({
         name: RULES_SECTION,
         order: RULES_ORDER,
-        text: () => (this.source().injectRules ? project.rulesBlock() : ''),
+        text: () => this.rulesSection(binding),
       })
     })
-    this.promptFibers.set(agent, fiber)
+  }
+
+  /**
+   * The rule section's text for one assembly.
+   * @param binding - the agent's binding.
+   * @returns the escaped rule block, or `''` when enforcement is off or the project has no rules.
+   */
+  private rulesSection(binding: AgentBinding): string {
+    if (!this.source().injectRules) return ''
+    return escapePromptText(this.currentProject(binding).rulesBlock())
+  }
+
+  /**
+   * The project an agent's directory resolves to right now, re-binding the agent when it moved.
+   *
+   * Synchronous, because prompt assembly is. When the resolved project is not open yet, it is opened
+   * for the next assembly and the agent keeps the rules it was bound by until then: one request under
+   * the previous rule set is a smaller failure than one request under none.
+   * @param binding - the agent's binding.
+   * @returns the project to read.
+   */
+  private currentProject(binding: AgentBinding): ProjectMemory {
+    let key: string
+    try {
+      key = this.keyFor(binding.cwd)
+    } catch (error) {
+      this.ctx.logger.warn(`dsh-memory: could not resolve the memory database for "${binding.cwd}": ${String(error)}`)
+      return binding.project
+    }
+    if (key === binding.project.databasePath) return binding.project
+    const current = this.opened.get(key)
+    if (current !== undefined) {
+      binding.project = current
+      return current
+    }
+    this.project(binding.cwd).catch((error: unknown) => {
+      this.ctx.logger.warn(`dsh-memory: could not open memory for "${binding.cwd}": ${String(error)}`)
+    })
+    return binding.project
   }
 
   /**
    * Remind the model to file a session summary at the turn's stop boundary.
    *
-   * Under `once` the reminder lands on the first turn that reaches a stop boundary and never again,
-   * which is the difference between a prompt the model acts on and one it learns to ignore.
+   * Under `once` the reminder lands on the first turn that reaches a stop boundary WITH a session to
+   * file against, and never again — which is the difference between a prompt the model acts on and
+   * one it learns to ignore. The policy is spent only when a reminder is actually sent; a turn with
+   * no session of its own must not use it up.
    * @param agent - the agent whose turn is closing.
    */
   private onTurnStopping(agent: Agent): void {
     const config = this.source()
     if (config.remind === 'never' || !config.autoSession) return
-    if (config.remind === 'once') {
-      if (this.reminded.has(agent)) return
-      this.reminded.add(agent)
-    }
-    const cwd = agent.session.header.cwd
-    if (cwd === undefined) return
-    void (async () => {
-      const project = await this.project(cwd)
-      const sessionId = project.sessionId
-      if (sessionId === undefined) return
-      agent.inject(createUserMessage({
-        content: [{ type: 'text', text: renderSessionEndReminder(project.project, sessionId) }],
-        source: { kind: 'plugin', plugin: 'dsh-memory' },
-      }))
-    })().catch((error: unknown) => {
-      this.ctx.logger.warn(`dsh-memory: session-end reminder failed: ${String(error)}`)
-    })
+    if (config.remind === 'once' && this.reminded.has(agent)) return
+    const binding = this.bindings.get(agent)
+    if (binding === undefined || binding.subagent) return
+    const project = this.currentProject(binding)
+    const sessionId = project.sessionIdFor(agent.id)
+    if (sessionId === undefined) return
+    if (config.remind === 'once') this.reminded.add(agent)
+    agent.inject(createUserMessage({
+      content: [{ type: 'text', text: renderSessionEndReminder(project.project, sessionId) }],
+      source: { kind: 'plugin', plugin: 'dsh-memory' },
+    }))
   }
 
   /**
-   * Drop the agent's rule section when the agent goes away.
+   * Drop the agent's rule section and forget its memory session when the agent goes away.
    *
    * The project's database stays open: another agent may share it, and reopening a DuckDB file costs
-   * a lock round trip that the plugin's own teardown handles once instead.
+   * a lock round trip that the plugin's own teardown handles once instead. The session row stays open
+   * too, and the next start closes it as an orphan — nobody filed its summary.
    * @param agent - the disposed agent.
    */
   private onAgentDisposed(agent: Agent): void {
-    const fiber = this.promptFibers.get(agent)
-    if (fiber === undefined) return
-    this.promptFibers.delete(agent)
-    void fiber.dispose().catch((error: unknown) => {
+    this.attached.delete(agent)
+    const binding = this.bindings.get(agent)
+    if (binding === undefined) return
+    this.bindings.delete(agent)
+    binding.project.releaseSession(agent.id)
+    binding.fiber?.dispose().catch((error: unknown) => {
       this.ctx.logger.warn(`dsh-memory: rule section cleanup failed: ${String(error)}`)
     })
   }
@@ -452,16 +649,20 @@ export class MemoryService extends TypertRemoteService {
   async list(request: MemoryListRequest): Promise<MemoryListResult> {
     try {
       const project = await this.project(request.project)
-      const page = await project.list({
+      // The browser is a trust boundary like the model is: the same validation, the same ceilings.
+      // A blank text filter is the search box being empty, not a request to match the empty string.
+      const text = request.text?.trim()
+      const query = parseListQuery({
         ...request.status === undefined ? {} : { status: request.status },
         ...request.category === undefined ? {} : { category: request.category },
         ...request.tags === undefined ? {} : { tags: request.tags },
-        ...request.text === undefined ? {} : { text: request.text },
+        ...text === undefined || text.length === 0 ? {} : { text },
         ...request.limit === undefined ? {} : { limit: request.limit },
         ...request.offset === undefined ? {} : { offset: request.offset },
         ...request.sortBy === undefined ? {} : { sortBy: request.sortBy },
         ...request.sortOrder === undefined ? {} : { sortOrder: request.sortOrder },
-      }, Date.now())
+      })
+      const page = await project.list(query, Date.now())
       return {
         ok: true,
         memories: page.memories.map(toMemoryView),
@@ -484,13 +685,14 @@ export class MemoryService extends TypertRemoteService {
   async search(request: MemorySearchRequest, signal: AbortSignal): Promise<MemorySearchResult> {
     try {
       const project = await this.project(request.project)
-      const result = await project.search({
+      const query = parseSearchQuery({
         query: request.query,
         limit: request.limit ?? this.source().searchLimit,
         ...request.category === undefined ? {} : { category: request.category },
         ...request.tags === undefined ? {} : { tags: request.tags },
         ...request.minSimilarity === undefined ? {} : { minSimilarity: request.minSimilarity },
-      }, Date.now(), signal)
+      })
+      const result = await project.search(query, Date.now(), signal)
       return {
         ok: true,
         query: result.query,
@@ -625,15 +827,22 @@ export class MemoryService extends TypertRemoteService {
   @Remote('importInstructions')
   async importInstructions(request: MemoryImportRequest): Promise<MemoryImportResult> {
     try {
+      const { text, source } = parseImport({ text: request.text, source: request.source })
       const project = await this.project(request.project)
       const now = Date.now()
-      const parsed = parseInstructions(request.text)
+      const parsed = parseInstructions(text)
       if (parsed.length === 0) {
         return { ok: false, code: 'invalid', message: 'nothing in that file looked like a rule or a note' }
       }
+      if (parsed.length > IMPORT_ENTRY_LIMIT) {
+        throw new MemoryInputError(`that file holds ${parsed.length} entries; an import creates at most ${IMPORT_ENTRY_LIMIT}`)
+      }
+      // Every entry is validated before the first is written, with the ceilings a memory typed into
+      // the manager gets, so a bad entry refuses the import instead of leaving half of it behind.
+      const inputs = parsed.map(entry => MemoryService.importEntry(entry, source))
       const created = []
-      for (const entry of parsed) {
-        const written = await project.create({ ...entry, source: request.source }, 'user', now)
+      for (const input of inputs) {
+        const written = await project.create(input, 'user', now)
         created.push(written.memory)
       }
       return {
@@ -644,6 +853,22 @@ export class MemoryService extends TypertRemoteService {
       }
     } catch (error) {
       return failure(error)
+    }
+  }
+
+  /**
+   * Validate one parsed import entry as a create request.
+   * @param entry - what the instructions parser produced.
+   * @param source - the source label every imported memory records.
+   * @returns the accepted input.
+   * @throws MemoryInputError naming the entry when a field is rejected.
+   */
+  private static importEntry(entry: CreateMemoryInput, source: string): CreateMemoryInput {
+    try {
+      return parseCreate({ ...entry, source })
+    } catch (error) {
+      if (!(error instanceof MemoryInputError)) throw error
+      throw new MemoryInputError(`imported entry "${entry.title.slice(0, 60)}": ${error.message}`)
     }
   }
 
@@ -677,12 +902,11 @@ export class MemoryService extends TypertRemoteService {
   @Remote('reembed')
   async reembed(request: MemoryProjectRequest): Promise<MemoryEmbedResult> {
     try {
-      await this.describeEmbedding()
       const project = await this.project(request.project)
-      project.setEmbedder(this.embedder())
+      // Let the background pass finish first, so this pass does not embed the same rows beside it.
+      await project.whenEmbedded()
       const embedded = await project.drainEmbeddings()
-      const stats = await project.stats(Date.now())
-      return { ok: true, embedded, remaining: Math.max(0, stats.active - stats.embedded) }
+      return { ok: true, embedded, remaining: await project.pendingEmbeddings(Date.now()) }
     } catch (error) {
       return failure(error)
     }

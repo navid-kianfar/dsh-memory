@@ -15,9 +15,10 @@ node_modules/
 Thumbs.db
 
 # NOTE: `generated/` is deliberately NOT ignored. It holds the Typert RPC
-# contract, which only the deepseek-harness generator can produce, so this
-# package cannot rebuild it on its own — it ships as committed source.
-# `pnpm test` fails if it drifts from src/host/; see scripts/regen-typert.mjs.
+# contract, rendered from the hand-maintained table in scripts/typert-endpoints.mjs
+# rather than by the deepseek-harness generator — it ships as committed source.
+# `pnpm test` fails if it drifts from src/host/ or from that table; after
+# updating the table, run scripts/regen-typert.mjs to regenerate and re-record.
 
 # JetBrains
 .idea/

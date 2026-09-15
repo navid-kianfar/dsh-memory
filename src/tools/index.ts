@@ -15,10 +15,11 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { ProjectMemory } from '../host/memory.ts'
+import { isSubagentSession } from '../host/lineage.ts'
 import type { Memory, MemoryCategory, MemoryStatus } from '../domain/types.ts'
 import { MEMORY_CATEGORIES, MEMORY_STATUSES, MEMORY_SORT_KEYS } from '../domain/types.ts'
+import { AGENT_SOURCE, isAgentAuthored, type WriteOrigin } from '../domain/authorship.ts'
 import {
   parseCreate, parseListQuery, parseSearchQuery, parseUpdate, requireRuleCategory, requireText,
   TITLE_MAX_CHARS,
@@ -40,6 +41,14 @@ export interface Config {
    */
   toolset: 'core' | 'full'
 }
+
+/**
+ * The agent a tool call runs in, as the tool registry hands it over.
+ *
+ * Derived from the `agents` service rather than imported by name, so it is the type the running
+ * harness declares even when a linked development checkout disagrees with the installed release.
+ */
+type Agent = ReturnType<Context['agents']['list']>[number]
 
 /** How many hits a search returns when the model does not say. */
 const SEARCH_DEFAULT_LIMIT = 8
@@ -63,6 +72,7 @@ const MEMORY_OUTPUT = {
     tags: { type: 'array', required: true, items: { type: 'string' } },
     status: { type: 'string', required: true, enum: [...MEMORY_STATUSES] },
     priority: { type: 'integer', required: true },
+    source: { type: 'string', required: true },
     createdAt: { type: 'integer', required: true },
     updatedAt: { type: 'integer', required: true },
   },
@@ -78,6 +88,8 @@ interface MemoryOut {
   tags: string[]
   status: MemoryStatus
   priority: number
+  /** `assistant` when an agent wrote it; anything else was written by a person. */
+  source: string
   createdAt: number
   updatedAt: number
 }
@@ -97,6 +109,7 @@ function out(memory: Memory): MemoryOut {
     tags: [...memory.tags],
     status: memory.status,
     priority: memory.priority,
+    source: memory.source,
     createdAt: memory.createdAt,
     updatedAt: memory.updatedAt,
   }
@@ -119,6 +132,32 @@ async function projectFor(ctx: Context, agent: Agent | undefined): Promise<Proje
     throw new Error('memory tools need a session working directory; this call has none')
   }
   return ctx.memory.project(cwd)
+}
+
+/**
+ * Describe the calling agent to the memory it writes to.
+ *
+ * Every tool call is an agent's, so every call carries an `agent` origin: that is what subjects it to
+ * the authorship rules — no rewriting the user's rules, no rules at all from a subagent — and what
+ * attributes its reads and writes to its own memory session rather than another agent's.
+ * @param agent - the calling agent, when there is one.
+ * @returns the origin to pass to the memory.
+ */
+function originOf(agent: Agent | undefined): WriteOrigin {
+  if (agent === undefined) return { agent: { subagent: false } }
+  return { session: agent.id, agent: { subagent: isSubagentSession(agent.session.header) } }
+}
+
+/**
+ * Render a rule as one line of tool output, marking the ones an agent added.
+ * @param rule - the rule as the tool returns it.
+ * @param rule.title - its title.
+ * @param rule.content - its body.
+ * @param rule.source - who wrote it.
+ * @returns the line.
+ */
+function ruleLine(rule: { title: string, content: string, source: string }): string {
+  return `- ${isAgentAuthored(rule) ? '[added by an agent] ' : ''}${rule.title}: ${rule.content}`
 }
 
 /**
@@ -192,7 +231,7 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args, exec) {
       const memory = await project(exec.agent)
       const query = parseSearchQuery({ ...args, limit: args.limit ?? SEARCH_DEFAULT_LIMIT })
-      const result = await memory.search(query, Date.now(), exec.signal)
+      const result = await memory.search(query, Date.now(), exec.signal, originOf(exec.agent))
       return {
         query: result.query,
         semantic: result.semantic,
@@ -231,7 +270,9 @@ export function apply(ctx: Context, config: Config): void {
     presentCall: args => ({ card: 'generic', title: `Remember: ${String(args['title'] ?? '')}` }),
     async execute(args, exec) {
       const memory = await project(exec.agent)
-      const written = await memory.create(parseCreate({ ...args, source: 'assistant' }), 'agent', Date.now())
+      const written = await memory.create(
+        parseCreate({ ...args, source: AGENT_SOURCE }), 'agent', Date.now(), originOf(exec.agent),
+      )
       return out(written.memory)
     },
   }))
@@ -254,7 +295,7 @@ export function apply(ctx: Context, config: Config): void {
       return out(await memory.recall({
         ...args.id === undefined ? {} : { id: args.id },
         ...args.title === undefined ? {} : { title: args.title },
-      }, Date.now()))
+      }, Date.now(), originOf(exec.agent)))
     },
   }))
 
@@ -278,8 +319,8 @@ export function apply(ctx: Context, config: Config): void {
         type: 'text',
         text: value.mandatory.length + value.forbidden.length === 0
           ? 'This project has no binding rules.'
-          : `MANDATORY:\n${value.mandatory.map(rule => `- ${rule.title}: ${rule.content}`).join('\n') || '(none)'}\n\n`
-            + `FORBIDDEN:\n${value.forbidden.map(rule => `- ${rule.title}: ${rule.content}`).join('\n') || '(none)'}`,
+          : `MANDATORY:\n${value.mandatory.map(ruleLine).join('\n') || '(none)'}\n\n`
+            + `FORBIDDEN:\n${value.forbidden.map(ruleLine).join('\n') || '(none)'}`,
       }],
     },
     async execute(_args, exec) {
@@ -296,7 +337,8 @@ export function apply(ctx: Context, config: Config): void {
       + 'NEVER do. Rules are injected into every request from now on, including in future sessions, '
       + 'and survive context compaction. Add one whenever the user says "always", "never", "make '
       + 'sure you", or corrects the same mistake twice. Keep each rule to one obligation so it can '
-      + 'be changed or withdrawn on its own.',
+      + 'be changed or withdrawn on its own. Rules you add are labelled as added by an agent, and a '
+      + 'subagent cannot add them.',
     parameters: {
       rule_type: {
         type: 'string',
@@ -313,8 +355,8 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args, exec) {
       const memory = await project(exec.agent)
       const written = await memory.create(parseCreate({
-        ...args, category: requireRuleCategory(args.rule_type), source: 'assistant',
-      }), 'agent', Date.now())
+        ...args, category: requireRuleCategory(args.rule_type), source: AGENT_SOURCE,
+      }), 'agent', Date.now(), originOf(exec.agent))
       return out(written.memory)
     },
   }))
@@ -327,7 +369,7 @@ export function apply(ctx: Context, config: Config): void {
       + 'what you did. Call it once, when the work is done.',
     parameters: {
       summary: { type: 'string', required: true, description: 'What was decided, what is unfinished, and what comes next.' },
-      session_id: { type: 'string', description: 'The session to close; defaults to the one this agent opened.' },
+      session_id: { type: 'string', description: 'The session to close; defaults to the one this agent opened. Another agent\'s session is refused.' },
     },
     output: {
       schema: {
@@ -348,8 +390,11 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args, exec) {
       const memory = await project(exec.agent)
       const summary = requireText(args.summary, 'summary', 20_000)
-      const sessionId = args.session_id ?? memory.sessionId
-      const closed = await memory.endSession(sessionId, summary, Date.now())
+      // The caller's OWN session: a subagent shares its parent's project, and "the project's session"
+      // would file one agent's summary over another's work.
+      const owner = originOf(exec.agent).session
+      const sessionId = args.session_id ?? (owner === undefined ? undefined : memory.sessionIdFor(owner))
+      const closed = owner === undefined ? false : await memory.endSession(sessionId, summary, Date.now(), owner)
       return { closed, ...sessionId === undefined ? {} : { sessionId } }
     },
   }))
@@ -401,7 +446,8 @@ export function apply(ctx: Context, config: Config): void {
     name: 'memory_update',
     description:
       'Change a stored memory in place — correct it, add what was learned since, or reclassify it. '
-      + 'Only the fields you supply change. Editing a rule changes what binds every later request.',
+      + 'Only the fields you supply change. Editing a rule changes what binds every later request. '
+      + 'A rule the user wrote can only be changed by the user, in the Memory tab.',
     parameters: {
       memory_id: { type: 'string', required: true, description: 'The memory to change.' },
       title: { type: 'string' },
@@ -413,7 +459,17 @@ export function apply(ctx: Context, config: Config): void {
     output: { schema: MEMORY_OUTPUT, render: (_args, value) => [{ type: 'text', text: `Updated "${value.title}" (id ${value.id}).` }] },
     async execute(args, exec) {
       const memory = await project(exec.agent)
-      const written = await memory.update(parseUpdate(args), 'agent', Date.now())
+      // Only the fields this tool declares: lifecycle and sidecar changes are the user's, from the
+      // manager, whatever else a generated argument object happens to carry.
+      const patch = parseUpdate({
+        memory_id: args.memory_id,
+        ...args.title === undefined ? {} : { title: args.title },
+        ...args.content === undefined ? {} : { content: args.content },
+        ...args.tags === undefined ? {} : { tags: args.tags },
+        ...args.priority === undefined ? {} : { priority: args.priority },
+        ...args.category === undefined ? {} : { category: args.category },
+      })
+      const written = await memory.update(patch, 'agent', Date.now(), originOf(exec.agent))
       return out(written.memory)
     },
   }))
@@ -423,7 +479,8 @@ export function apply(ctx: Context, config: Config): void {
     description:
       'Retire a memory that is no longer true. It stops being recalled and, if it was a rule, stops '
       + 'binding — but it stays restorable and auditable. Prefer this to deleting: a superseded '
-      + 'decision is part of how the project got here.',
+      + 'decision is part of how the project got here. A rule the user wrote can only be retired by the '
+      + 'user, in the Memory tab.',
     parameters: {
       memory_id: { type: 'string', required: true, description: 'The memory to retire.' },
       reason: { type: 'string', description: 'Why it is no longer true; recorded on the audit trail.' },
@@ -446,10 +503,8 @@ export function apply(ctx: Context, config: Config): void {
     async execute(args, exec) {
       const memory = await project(exec.agent)
       const id = requireText(args.memory_id, 'memory_id', TITLE_MAX_CHARS)
-      const written = await memory.archive(
-        id, 'agent', Date.now(),
-        ...args.reason === undefined ? [] : [requireText(args.reason, 'reason', 2000)],
-      )
+      const reason = args.reason === undefined ? undefined : requireText(args.reason, 'reason', 2000)
+      const written = await memory.archive(id, 'agent', Date.now(), reason, originOf(exec.agent))
       return { id: written.memory.id, title: written.memory.title, rulesChanged: written.rulesChanged }
     },
   }))

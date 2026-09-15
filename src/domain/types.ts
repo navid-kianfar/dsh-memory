@@ -37,9 +37,10 @@ export type MemoryCategory = typeof MEMORY_CATEGORIES[number]
 /**
  * The two categories that are enforced rather than recalled.
  *
- * Entries in these categories are injected into every model request verbatim and completely, never
- * ranked or truncated, which is what separates a rule from a decision that merely records the same
- * fact.
+ * Entries in these categories are injected into every model request, never ranked, which is what
+ * separates a rule from a decision that merely records the same fact. The injected block is bounded
+ * (see `domain/rules.ts`): an oversized rule is cut with a marker, and when the whole set does not fit
+ * the rules an agent added are left out before any the user wrote — always with a line saying so.
  */
 export const RULE_CATEGORIES = ['mandatory_rules', 'forbidden_rules'] as const
 

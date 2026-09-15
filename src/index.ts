@@ -21,7 +21,13 @@ export {
   DEFAULT_RELEVANCE_WEIGHTS, FIELD_WEIGHTS, LEXICAL_FIELDS, blendSimilarity, relevance, scoreLexical,
 } from './domain/score.ts'
 export { DEFAULT_RETENTION_DAYS, expiresAt } from './domain/retention.ts'
-export { renderRules, renderSessionContext, renderSessionEndReminder } from './domain/rules.ts'
+export {
+  PROMPT_LITERAL_BRACES, escapePromptText, renderRules, renderSessionContext, renderSessionEndReminder,
+} from './domain/rules.ts'
+export {
+  AGENT_RULE_CONTENT_MAX_CHARS, AGENT_RULE_LIMIT, AGENT_SOURCE, MemoryForbiddenError, isAgentAuthored,
+} from './domain/authorship.ts'
+export type { WriteOrigin } from './domain/authorship.ts'
 export {
   MemoryInputError, MemoryNotFoundError, parseCreate, parseListQuery, parseSearchQuery, parseUpdate,
 } from './domain/validate.ts'

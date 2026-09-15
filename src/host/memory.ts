@@ -12,14 +12,18 @@
  */
 
 import { randomUUID } from 'node:crypto'
-import { MemoryStore, type StoredMemory } from './store.ts'
+import { MemoryStore, type EmbeddingIdentity, type StoredMemory } from './store.ts'
 import { blendSimilarity, relevance, scoreLexical, type RelevanceWeights } from '../domain/score.ts'
 import { embeddingText, estimateTokens, extractEntities, projectSlug, queryTerms, summarize } from '../domain/text.ts'
 import { expiresAt } from '../domain/retention.ts'
 import { renderRules } from '../domain/rules.ts'
 import { MemoryNotFoundError } from '../domain/validate.ts'
 import {
-  RULE_CATEGORIES, RULE_MIN_PRIORITY,
+  AGENT_SOURCE, MemoryForbiddenError, assertAgentMayChange, assertAgentMayCreate, isRuleCategory,
+  type WriteOrigin,
+} from '../domain/authorship.ts'
+import {
+  RULE_MIN_PRIORITY,
   type CreateMemoryInput, type ListMemoriesQuery, type Memory, type MemoryCategory, type MemoryPage,
   type MemorySession, type MemoryStats, type ProvenanceEntry, type ProvenanceOperation,
   type RuleSet, type SearchHit, type SearchIndexEntry, type SearchQuery, type SearchResult,
@@ -46,6 +50,16 @@ const DECISION_WINDOW_DAYS = 7
 /** Milliseconds in a day. */
 const DAY_MS = 86_400_000
 
+/**
+ * The session owner for a caller that names none.
+ *
+ * Sessions are keyed by the harness session of the agent that owns them, because one project is
+ * worked on by several agents at once — a parent and its subagents, or two top-level sessions in one
+ * Web Client. A same-process caller with no agent (a test, a script) gets this one key, which keeps
+ * the single-session behaviour such callers were written against.
+ */
+export const HOST_SESSION_OWNER = 'host'
+
 /** Everything one project's memory needs beyond its store. */
 export interface ProjectMemoryOptions {
   /** Absolute path of the project directory this memory belongs to. */
@@ -66,10 +80,32 @@ export interface ProjectMemoryOptions {
   readonly embedBatch: number
 }
 
+/** A memory session an agent in this process currently owns. */
+interface OpenSession {
+  readonly id: string
+  /** Memories this session's agent wrote; mutable because it is a running tally. */
+  created: number
+  /** Memories this session's agent read. */
+  accessed: number
+}
+
 /** The embedding side of the plugin, as this object needs it. */
 export interface Embedder {
-  /** The model's identity, stored beside each vector so a model change is detectable. */
+  /**
+   * The model's real identity, stored beside each vector so a model change is detectable.
+   *
+   * Must be the provider's own answer, never a placeholder: a vector stamped with a stand-in name
+   * reads as "another model's" once the real name is known, and everything gets embedded again.
+   */
   readonly model: string
+  /**
+   * The vector length the provider emits, when it is known without a call.
+   *
+   * When absent it is learned from the provider's first answer. Either way it is compared with each
+   * stored vector's length, so a provider reconfigured to a new dimension under the same model name
+   * re-embeds what it stranded instead of leaving it unreachable by semantic search.
+   */
+  readonly dimensions?: number
   /**
    * Embed a batch of texts.
    * @param texts - the texts to embed, in order.
@@ -91,39 +127,68 @@ export class ProjectMemory {
   /** The rendered rule block, or `''`. Recomputed on demand and after every rule write. */
   #rulesBlock: string | undefined
   #embedder: Embedder | undefined
+  /** The attached provider's vector length: reported, learned from its answers, or not yet known. */
+  #dimensions: number | undefined
   #embedPass: Promise<unknown> | undefined
   #embedAgain = false
   readonly #abort = new AbortController()
-  /** The open memory session, when a session has started against this project. */
-  #sessionId: string | undefined
-  #created = 0
-  #accessed = 0
+  /** Open memory sessions keyed by the harness session of the agent that owns each. */
+  readonly #sessions = new Map<string, OpenSession>()
+  /** The current settings, read per call so a committed settings change reaches an open project. */
+  readonly #options: () => ProjectMemoryOptions
+  readonly #projectRoot: string
+  readonly #databasePath: string
 
   /**
    * @param store - the project's open database.
-   * @param options - ranking, retention, and embedding settings.
+   * @param options - ranking, retention, and embedding settings; pass a function to have them read
+   *   at each call. The project root and database path are this object's identity and are fixed from
+   *   the first read — a different file is a different project, opened as its own object.
    * @param onRulesChanged - called after a write that changed the rule set, so a prompt registration
    *   holding the previous block can drop it.
    */
   constructor(
     private readonly store: MemoryStore,
-    private readonly options: ProjectMemoryOptions,
+    options: ProjectMemoryOptions | (() => ProjectMemoryOptions),
     private readonly onRulesChanged: () => void = () => {},
-  ) {}
+  ) {
+    this.#options = typeof options === 'function' ? options : () => options
+    const initial = this.#options()
+    this.#projectRoot = initial.projectRoot
+    this.#databasePath = initial.databasePath
+  }
 
   /** The project's slug, derived from its directory name. */
   get project(): string {
-    return projectSlug(this.options.projectRoot)
+    return projectSlug(this.#projectRoot)
+  }
+
+  /** Absolute path of the project directory this memory belongs to. */
+  get projectRoot(): string {
+    return this.#projectRoot
   }
 
   /** Absolute path of the database file backing this memory. */
   get databasePath(): string {
-    return this.options.databasePath
+    return this.#databasePath
   }
 
-  /** The open memory session's id, when one has started. */
+  /**
+   * The open memory session of a caller that names no owner.
+   * @deprecated Sessions are per agent; use {@link sessionIdFor} with the agent's session id.
+   * @returns the session id, when one is open for {@link HOST_SESSION_OWNER}.
+   */
   get sessionId(): string | undefined {
-    return this.#sessionId
+    return this.sessionIdFor(HOST_SESSION_OWNER)
+  }
+
+  /**
+   * The memory session one agent owns.
+   * @param owner - the agent's harness session id.
+   * @returns the open memory session's id, or undefined when that agent has none.
+   */
+  sessionIdFor(owner: string): string | undefined {
+    return this.#sessions.get(owner)?.id
   }
 
   /**
@@ -135,6 +200,7 @@ export class ProjectMemory {
    */
   setEmbedder(embedder: Embedder | undefined): void {
     this.#embedder = embedder
+    this.#dimensions = embedder?.dimensions
     if (embedder !== undefined) this.scheduleEmbedding()
   }
 
@@ -187,15 +253,20 @@ export class ProjectMemory {
 
   /**
    * Store a new memory, deriving everything the author did not supply.
+   *
+   * The insert and its audit entry commit together, and an agent's rule is checked against the
+   * agent quota inside the same transaction, so two concurrent rules cannot both take the last slot.
    * @param input - the validated create request.
    * @param actor - who is writing: `agent`, `user`, or a caller-supplied label.
    * @param now - the write time.
+   * @param origin - the calling agent, for authorship rules and session counters; absent for a person.
    * @returns the stored memory and whether it changed the rule set.
+   * @throws MemoryForbiddenError when an agent may not add this rule.
    */
-  async create(input: CreateMemoryInput, actor: string, now: number): Promise<WriteResult> {
-    const isRule = (RULE_CATEGORIES as readonly string[]).includes(input.category)
+  async create(input: CreateMemoryInput, actor: string, now: number, origin?: WriteOrigin): Promise<WriteResult> {
+    const isRule = isRuleCategory(input.category)
     const priority = isRule ? Math.max(input.priority ?? 0, RULE_MIN_PRIORITY) : input.priority ?? 0
-    const expiry = expiresAt(input.category, priority, now, this.options.retentionDays)
+    const expiry = expiresAt(input.category, priority, now, this.#options().retentionDays)
     const stored: StoredMemory = {
       id: randomUUID(),
       category: input.category,
@@ -207,34 +278,77 @@ export class ProjectMemory {
       relatedIds: input.relatedIds ?? [],
       status: 'active',
       priority,
-      source: input.source ?? 'assistant',
+      // An agent's write is labelled as an agent's whatever its arguments claimed: the label is what
+      // decides who may later change a rule, so it cannot be something the model chooses.
+      source: origin?.agent === undefined ? input.source ?? AGENT_SOURCE : AGENT_SOURCE,
       createdAt: now,
       updatedAt: now,
       ...input.metadata === undefined ? {} : { metadata: input.metadata },
       ...expiry === undefined ? {} : { expiresAt: expiry },
     }
-    const memory = await this.store.insert(stored)
-    this.#created += 1
-    await this.record(memory.id, 'create', actor, now, {
-      category: memory.category, title: memory.title, entities: memory.entities.length,
+    const memory = await this.store.transaction(async (tx) => {
+      const agentRules = origin?.agent !== undefined && isRule ? await tx.countLiveRules(AGENT_SOURCE, now) : 0
+      assertAgentMayCreate(input.category, input.content, origin, agentRules)
+      const inserted = await tx.insert(stored)
+      await tx.recordProvenance({
+        memoryId: inserted.id, operation: 'create', actor, at: now,
+        details: { category: inserted.category, title: inserted.title, entities: inserted.entities.length },
+      })
+      return inserted
     })
+    this.#tally(origin, 'created', 1)
     if (isRule) await this.rulesDidChange(now)
     this.scheduleEmbedding()
     return { memory, rulesChanged: isRule }
   }
 
   /**
-   * Apply a patch, re-deriving the summary, entities, and retention when the text or category moved.
+   * Apply a patch, re-deriving the summary, entities, and retention when the text, category, or
+   * lifecycle moved.
+   *
+   * The read, the derivation, the authorship check, the write, and the audit entry are one
+   * transaction, so an edit is always derived from the row as it is when the edit applies — two
+   * overlapping edits cannot each compute from a row the other has already changed.
    * @param patch - the validated update request.
    * @param actor - who is writing.
    * @param now - the write time.
+   * @param origin - the calling agent, for authorship rules; absent for a person.
    * @returns the updated memory and whether the rule set changed.
    * @throws MemoryNotFoundError when the id is unknown.
+   * @throws MemoryForbiddenError when an agent may not make this change.
    */
-  async update(patch: UpdateMemoryInput, actor: string, now: number): Promise<WriteResult> {
-    const existing = await this.store.get(patch.id)
-    if (existing === undefined) throw new MemoryNotFoundError(`no memory with id "${patch.id}"`)
+  async update(patch: UpdateMemoryInput, actor: string, now: number, origin?: WriteOrigin): Promise<WriteResult> {
+    const options = this.#options()
+    const { memory, rulesChanged } = await this.store.transaction(async (tx) => {
+      const existing = await tx.read(patch.id)
+      if (existing === undefined) throw new MemoryNotFoundError(`no memory with id "${patch.id}"`)
+      const category = patch.category ?? existing.category
+      assertAgentMayChange(existing, category, patch.content ?? existing.content, origin)
+      if (origin?.agent !== undefined && isRuleCategory(category) && !isRuleCategory(existing.category)) {
+        assertAgentMayCreate(category, patch.content ?? existing.content, origin, await tx.countLiveRules(AGENT_SOURCE, now))
+      }
+      const { columns, changed } = ProjectMemory.derivePatch(existing, patch, now, options)
+      const updated = await tx.update(patch.id, columns, now)
+      if (updated === undefined) throw new MemoryNotFoundError(`no memory with id "${patch.id}"`)
+      await tx.recordProvenance({ memoryId: updated.id, operation: 'update', actor, at: now, details: { changed } })
+      return { memory: updated, rulesChanged: isRuleCategory(existing.category) || isRuleCategory(category) }
+    })
+    if (rulesChanged) await this.rulesDidChange(now)
+    this.scheduleEmbedding()
+    return { memory, rulesChanged }
+  }
 
+  /**
+   * Turn a patch into the columns it writes, from the row as it currently is.
+   * @param existing - the row before the change.
+   * @param patch - the requested change.
+   * @param now - the write time, which a recomputed retention date counts from.
+   * @param options - the settings in force for this write.
+   * @returns the columns to write and the names of the fields the caller changed.
+   */
+  private static derivePatch(
+    existing: Memory, patch: UpdateMemoryInput, now: number, options: ProjectMemoryOptions,
+  ): { columns: Record<string, unknown>, changed: string[] } {
     const columns: Record<string, unknown> = {}
     const changed: string[] = []
     if (patch.title !== undefined) { columns['title'] = patch.title; changed.push('title') }
@@ -246,19 +360,19 @@ export class ProjectMemory {
     if (patch.category !== undefined) { columns['category'] = patch.category; changed.push('category') }
 
     const category = patch.category ?? existing.category
-    const becameRule = (RULE_CATEGORIES as readonly string[]).includes(category)
+    const becameRule = isRuleCategory(category)
     if (patch.priority !== undefined) {
       columns['priority'] = becameRule ? Math.max(patch.priority, RULE_MIN_PRIORITY) : patch.priority
       changed.push('priority')
-    } else if (patch.category !== undefined && becameRule && existing.priority < RULE_MIN_PRIORITY) {
+    } else if (becameRule && existing.priority < RULE_MIN_PRIORITY) {
       // Reclassifying a note as a rule has to carry the rule priority floor with it, or the entry
       // would be enforced while sorting below every other rule in the injected block.
       columns['priority'] = RULE_MIN_PRIORITY
     }
 
-    const title = patch.title ?? existing.title
-    const content = patch.content ?? existing.content
     if (patch.title !== undefined || patch.content !== undefined) {
+      const title = patch.title ?? existing.title
+      const content = patch.content ?? existing.content
       columns['summary'] = summarize(title, content)
       columns['entities'] = extractEntities(`${title}. ${content}`)
       // The stored vector describes the previous text, so keeping it would let a stale vector answer
@@ -267,21 +381,12 @@ export class ProjectMemory {
       columns['embedding_model'] = null
       columns['embedding_dim'] = null
     }
-    if (patch.category !== undefined || patch.priority !== undefined) {
+    const restored = patch.status === 'active' && existing.status !== 'active'
+    if (patch.category !== undefined || patch.priority !== undefined || restored) {
       const priority = (columns['priority'] as number | undefined) ?? existing.priority
-      const expiry = expiresAt(category, priority, now, this.options.retentionDays)
-      columns['expires_at'] = expiry ?? null
+      columns['expires_at'] = expiresAt(category, priority, now, options.retentionDays) ?? null
     }
-
-    const memory = await this.store.update(patch.id, columns, now)
-    if (memory === undefined) throw new MemoryNotFoundError(`no memory with id "${patch.id}"`)
-    await this.record(memory.id, 'update', actor, now, { changed })
-
-    const wasRule = (RULE_CATEGORIES as readonly string[]).includes(existing.category)
-    const rulesChanged = wasRule || becameRule
-    if (rulesChanged) await this.rulesDidChange(now)
-    this.scheduleEmbedding()
-    return { memory, rulesChanged }
+    return { columns, changed }
   }
 
   /**
@@ -290,46 +395,63 @@ export class ProjectMemory {
    * @param actor - who is archiving.
    * @param now - the archive time.
    * @param reason - optional note recorded on the audit entry.
+   * @param origin - the calling agent, for authorship rules; absent for a person.
    * @returns the archived memory and whether the rule set changed.
    * @throws MemoryNotFoundError when the id is unknown.
+   * @throws MemoryForbiddenError when an agent may not retire this memory.
    */
-  async archive(id: string, actor: string, now: number, reason?: string): Promise<WriteResult> {
-    return this.setStatus(id, 'archived', 'archive', actor, now, reason)
+  async archive(id: string, actor: string, now: number, reason?: string, origin?: WriteOrigin): Promise<WriteResult> {
+    return this.setStatus(id, 'archived', 'archive', actor, now, reason, origin)
   }
 
   /**
-   * Return an archived or expired memory to the live set.
+   * Return an archived or expired memory to the live set, with a fresh retention window.
+   *
+   * The window restarts at the restore: a memory restored with its old deadline would be active but
+   * already past expiry — shown in neither the active nor the expired list, and expired again by the
+   * next session start.
    * @param id - the memory to restore.
    * @param actor - who is restoring.
    * @param now - the restore time.
+   * @param origin - the calling agent, for authorship rules; absent for a person.
    * @returns the restored memory and whether the rule set changed.
    * @throws MemoryNotFoundError when the id is unknown.
+   * @throws MemoryForbiddenError when an agent may not restore this memory.
    */
-  async restore(id: string, actor: string, now: number): Promise<WriteResult> {
-    return this.setStatus(id, 'active', 'restore', actor, now)
+  async restore(id: string, actor: string, now: number, origin?: WriteOrigin): Promise<WriteResult> {
+    return this.setStatus(id, 'active', 'restore', actor, now, undefined, origin)
   }
 
   /**
-   * Move a memory between lifecycle states and record why.
+   * Move a memory between lifecycle states and record why, as one transaction.
    * @param id - the memory to move.
    * @param status - the new status.
    * @param operation - the audit operation to record.
    * @param actor - who is acting.
    * @param now - the time of the change.
    * @param reason - optional note recorded on the audit entry.
+   * @param origin - the calling agent, for authorship rules; absent for a person.
    * @returns the memory and whether the rule set changed.
    * @throws MemoryNotFoundError when the id is unknown.
+   * @throws MemoryForbiddenError when an agent may not make this change.
    */
   private async setStatus(
     id: string, status: Memory['status'], operation: ProvenanceOperation,
-    actor: string, now: number, reason?: string,
+    actor: string, now: number, reason: string | undefined, origin: WriteOrigin | undefined,
   ): Promise<WriteResult> {
-    const existing = await this.store.get(id)
-    if (existing === undefined) throw new MemoryNotFoundError(`no memory with id "${id}"`)
-    const memory = await this.store.update(id, { status }, now)
-    if (memory === undefined) throw new MemoryNotFoundError(`no memory with id "${id}"`)
-    await this.record(id, operation, actor, now, reason === undefined ? undefined : { reason })
-    const rulesChanged = (RULE_CATEGORIES as readonly string[]).includes(existing.category)
+    const options = this.#options()
+    const { memory, rulesChanged } = await this.store.transaction(async (tx) => {
+      const existing = await tx.read(id)
+      if (existing === undefined) throw new MemoryNotFoundError(`no memory with id "${id}"`)
+      assertAgentMayChange(existing, existing.category, existing.content, origin)
+      const { columns } = ProjectMemory.derivePatch(existing, { id, status }, now, options)
+      const updated = await tx.update(id, columns, now)
+      if (updated === undefined) throw new MemoryNotFoundError(`no memory with id "${id}"`)
+      await tx.recordProvenance({
+        memoryId: id, operation, actor, at: now, ...reason === undefined ? {} : { details: { reason } },
+      })
+      return { memory: updated, rulesChanged: isRuleCategory(existing.category) }
+    })
     if (rulesChanged) await this.rulesDidChange(now)
     return { memory, rulesChanged }
   }
@@ -339,18 +461,23 @@ export class ProjectMemory {
    *
    * The audit trail goes with it deliberately: a trail pointing at a memory nobody can read is not
    * an audit, and keeping it would leave the deleted title recoverable after a delete meant to
-   * remove exactly that.
+   * remove exactly that. Both deletes are one transaction, so a failure cannot leave either behind.
    * @param id - the memory to remove.
    * @param now - the time of the removal.
+   * @param origin - the calling agent, for authorship rules; absent for a person.
    * @returns whether a memory was removed and whether the rule set changed.
+   * @throws MemoryForbiddenError when an agent may not remove this memory.
    */
-  async remove(id: string, now: number): Promise<{ removed: boolean, rulesChanged: boolean }> {
-    const existing = await this.store.get(id)
-    if (existing === undefined) return { removed: false, rulesChanged: false }
-    const removed = await this.store.hardDelete(id)
-    const rulesChanged = removed && (RULE_CATEGORIES as readonly string[]).includes(existing.category)
+  async remove(id: string, now: number, origin?: WriteOrigin): Promise<{ removed: boolean, rulesChanged: boolean }> {
+    const removed = await this.store.transaction(async (tx) => {
+      const existing = await tx.read(id)
+      if (existing === undefined) return undefined
+      assertAgentMayChange(existing, existing.category, existing.content, origin)
+      return tx.hardDelete(id)
+    })
+    const rulesChanged = removed !== undefined && isRuleCategory(removed.category)
     if (rulesChanged) await this.rulesDidChange(now)
-    return { removed, rulesChanged }
+    return { removed: removed !== undefined, rulesChanged }
   }
 
   /**
@@ -360,23 +487,6 @@ export class ProjectMemory {
   private async rulesDidChange(now: number): Promise<void> {
     await this.refreshRules(now)
     this.onRulesChanged()
-  }
-
-  /**
-   * Append one audit entry.
-   * @param memoryId - the memory affected.
-   * @param operation - what happened.
-   * @param actor - who did it.
-   * @param now - when.
-   * @param details - operation-specific facts.
-   */
-  private async record(
-    memoryId: string, operation: ProvenanceOperation, actor: string, now: number,
-    details?: Record<string, unknown>,
-  ): Promise<void> {
-    await this.store.recordProvenance({
-      memoryId, operation, actor, at: now, ...details === undefined ? {} : { details },
-    })
   }
 
   // ---------- reads ----------
@@ -392,13 +502,23 @@ export class ProjectMemory {
   }
 
   /**
+   * Read one memory by id without counting it as a use — for checks, not for handing text to a model.
+   * @param id - the memory id.
+   * @returns the memory, or undefined when the project does not hold it.
+   */
+  async get(id: string): Promise<Memory | undefined> {
+    return this.store.get(id)
+  }
+
+  /**
    * Read one memory by id or exact title, and count the read.
    * @param selector - the id or the exact title to find.
    * @param now - the current time.
+   * @param origin - the calling agent, whose session the read is counted against.
    * @returns the memory.
    * @throws MemoryNotFoundError when nothing matches.
    */
-  async recall(selector: { id?: string, title?: string }, now: number): Promise<Memory> {
+  async recall(selector: { id?: string, title?: string }, now: number, origin?: WriteOrigin): Promise<Memory> {
     const memory = selector.id !== undefined
       ? await this.store.get(selector.id)
       : selector.title !== undefined ? await this.store.getByTitle(selector.title) : undefined
@@ -407,8 +527,11 @@ export class ProjectMemory {
       throw new MemoryNotFoundError(`no memory matches "${named}"`)
     }
     await this.store.incrementAccess([memory.id])
-    await this.record(memory.id, 'access', 'agent', now, { via: selector.id !== undefined ? 'id' : 'title' })
-    this.#accessed += 1
+    await this.store.recordProvenance({
+      memoryId: memory.id, operation: 'access', actor: 'agent', at: now,
+      details: { via: selector.id !== undefined ? 'id' : 'title' },
+    })
+    this.#tally(origin, 'accessed', 1)
     return memory
   }
 
@@ -422,17 +545,19 @@ export class ProjectMemory {
    * @param query - the validated search request.
    * @param now - the current time.
    * @param signal - cancellation for the query embedding, when one is computed.
+   * @param origin - the calling agent, whose session the returned hits are counted against.
    * @returns the ranked hits, the full index, and what the token budget left out.
    */
-  async search(query: SearchQuery, now: number, signal: AbortSignal): Promise<SearchResult> {
+  async search(query: SearchQuery, now: number, signal: AbortSignal, origin?: WriteOrigin): Promise<SearchResult> {
+    const options = this.#options()
     const terms = queryTerms(query.query)
     const limit = query.limit ?? 10
-    const floor = query.minSimilarity ?? this.options.minSimilarity
+    const floor = query.minSimilarity ?? options.minSimilarity
     const vector = await this.embedQuery(query.query, signal)
 
     const candidates = await this.store.candidates(terms, vector, {
       now,
-      limit: this.options.candidateLimit,
+      limit: options.candidateLimit,
       ...query.category === undefined ? {} : { category: query.category },
     })
     const lexical = scoreLexical(terms, candidates.documents, candidates.stats)
@@ -444,7 +569,7 @@ export class ProjectMemory {
       }
       const cosine = candidates.cosine.get(memory.id)
       const similarity = blendSimilarity(
-        lexical.get(memory.id)?.normalized ?? 0, cosine, this.options.vectorWeight,
+        lexical.get(memory.id)?.normalized ?? 0, cosine, options.vectorWeight,
       )
       if (similarity < floor) continue
       const matched: ('lexical' | 'vector')[] = []
@@ -454,7 +579,7 @@ export class ProjectMemory {
         memory,
         similarity: Number(similarity.toFixed(4)),
         relevance: Number(
-          relevance(similarity, memory.updatedAt, memory.accessCount, now, this.options.relevanceWeights)
+          relevance(similarity, memory.updatedAt, memory.accessCount, now, options.relevanceWeights)
             .toFixed(4),
         ),
         matched,
@@ -464,7 +589,7 @@ export class ProjectMemory {
     const ranked = hits.slice(0, limit)
 
     await this.store.incrementAccess(ranked.map(hit => hit.memory.id))
-    this.#accessed += ranked.length
+    this.#tally(origin, 'accessed', ranked.length)
 
     const index: SearchIndexEntry[] = ranked.map(hit => ({
       id: hit.memory.id,
@@ -544,22 +669,32 @@ export class ProjectMemory {
   // ---------- sessions ----------
 
   /**
-   * Open a memory session and gather what the model should start with.
+   * Open a memory session for one agent and gather what the model should start with.
    *
    * Sessions left open by a previous crash are closed first. Their summaries are the orphan marker
    * rather than real text, so the "where we left off" answer skips past them to the last session
-   * that actually ended with something to say.
+   * that actually ended with something to say. A session another agent in this process still owns is
+   * NOT an orphan — it is open because it is in use — so it is left alone; only this owner's own
+   * previous session, replaced by this start, is closed with the marker.
    * @param now - the start time.
+   * @param owner - the harness session id of the agent the session belongs to.
    * @returns the rules, last summary, sprint goals, and recent decisions.
    */
-  async startSession(now: number): Promise<SessionContext> {
-    const orphansClosed = await this.store.closeOrphans(ORPHAN_SUMMARY, now)
-    await this.store.expireStale(now)
+  async startSession(now: number, owner: string = HOST_SESSION_OWNER): Promise<SessionContext> {
     const id = randomUUID()
-    await this.store.startSession(id, now)
-    this.#sessionId = id
-    this.#created = 0
-    this.#accessed = 0
+    // Reserved before the first await, so an overlapping start by another agent already counts this
+    // session as live and cannot close it as an orphan between its insert and this bookkeeping.
+    this.#sessions.set(owner, { id, created: 0, accessed: 0 })
+    const live = [...this.#sessions.values()].map(session => session.id).filter(open => open !== id)
+    let orphansClosed: number
+    try {
+      orphansClosed = await this.store.closeOrphans(ORPHAN_SUMMARY, now, live)
+      await this.store.expireStale(now)
+      await this.store.startSession(id, now)
+    } catch (error) {
+      if (this.#sessions.get(owner)?.id === id) this.#sessions.delete(owner)
+      throw error
+    }
 
     const rules = await this.refreshRules(now)
     const lastSummary = await this.store.lastSummary(ORPHAN_SUMMARY)
@@ -581,26 +716,82 @@ export class ProjectMemory {
 
   /**
    * Close a memory session with the summary the next one opens with.
-   * @param sessionId - the session to close; defaults to the open one.
+   * @param sessionId - the session to close; defaults to the owner's own open session.
    * @param summary - what the next session needs to know.
    * @param now - the end time.
+   * @param owner - the harness session id of the calling agent.
    * @returns whether an open session was closed.
+   * @throws MemoryForbiddenError when the named session belongs to another live agent.
    */
-  async endSession(sessionId: string | undefined, summary: string, now: number): Promise<boolean> {
-    const id = sessionId ?? this.#sessionId
+  async endSession(
+    sessionId: string | undefined, summary: string, now: number, owner: string = HOST_SESSION_OWNER,
+  ): Promise<boolean> {
+    const id = sessionId ?? this.#sessions.get(owner)?.id
     if (id === undefined) return false
-    const closed = await this.store.endSession(id, summary, this.#created, this.#accessed, now)
-    if (closed && id === this.#sessionId) this.#sessionId = undefined
+    const holder = [...this.#sessions.entries()].find(([, session]) => session.id === id)
+    if (holder !== undefined && holder[0] !== owner) {
+      throw new MemoryForbiddenError(
+        `memory session "${id}" belongs to another agent; call memory_session_end without a session_id `
+        + 'to file your summary against your own session',
+      )
+    }
+    const counters = holder?.[1]
+    const closed = await this.store.endSession(id, summary, counters?.created ?? 0, counters?.accessed ?? 0, now)
+    if (holder !== undefined && this.#sessions.get(owner)?.id === id) this.#sessions.delete(owner)
     return closed
+  }
+
+  /**
+   * Forget an agent's session without closing it, because the agent is gone.
+   *
+   * The row stays open, exactly as a crash would leave it, and the next session start closes it with
+   * the orphan marker — which is the truth: nobody filed a summary for it.
+   * @param owner - the harness session id of the departed agent.
+   */
+  releaseSession(owner: string): void {
+    this.#sessions.delete(owner)
+  }
+
+  /**
+   * Add to the running tally of the session a call belongs to.
+   * @param origin - the caller; a caller naming no session counts against {@link HOST_SESSION_OWNER}.
+   * @param field - which tally.
+   * @param count - how much to add.
+   */
+  #tally(origin: WriteOrigin | undefined, field: 'created' | 'accessed', count: number): void {
+    const session = this.#sessions.get(origin?.session ?? HOST_SESSION_OWNER)
+    if (session !== undefined) session[field] += count
   }
 
   // ---------- embeddings ----------
 
   /**
+   * The identity stored vectors are compared against, while a provider is attached.
+   * @returns the model and, when known, the dimension.
+   */
+  #identity(): EmbeddingIdentity | undefined {
+    const embedder = this.#embedder
+    if (embedder === undefined) return undefined
+    return { model: embedder.model, ...this.#dimensions === undefined ? {} : { dimensions: this.#dimensions } }
+  }
+
+  /**
+   * Count live memories still missing a usable vector.
+   * @param now - the current time, for evaluating expiry.
+   * @returns memories the attached provider has yet to embed, or — with no provider — every live
+   *   memory without a vector.
+   */
+  async pendingEmbeddings(now: number): Promise<number> {
+    return this.store.countWithoutEmbedding(this.#identity(), now)
+  }
+
+  /**
    * Embed one query, when a provider is mounted.
    *
    * A failing provider degrades to lexical ranking rather than failing the search: a search that
-   * returns keyword matches is useful, and one that returns an endpoint error is not.
+   * returns keyword matches is useful, and one that returns an endpoint error is not. An answer of a
+   * length the stored vectors do not have means the provider changed dimension, so a backfill is
+   * scheduled for what that stranded.
    * @param query - the query text.
    * @param signal - cancellation for the call.
    * @returns the query vector, or undefined when no provider is mounted or the call failed.
@@ -608,14 +799,37 @@ export class ProjectMemory {
   private async embedQuery(query: string, signal: AbortSignal): Promise<number[] | undefined> {
     const embedder = this.#embedder
     if (embedder === undefined) return undefined
+    let vectors: readonly (readonly number[])[]
     try {
-      const [vector] = await embedder.embed([query], signal)
-      return vector === undefined ? undefined : [...vector]
+      vectors = await embedder.embed([query], signal)
     } catch {
       // Classified provider failures and transport failures alike mean "no vector this time". The
       // lexical half of the ranking is unaffected, so the search still answers.
       return undefined
     }
+    const dimensions = ProjectMemory.accepted(vectors, 1)
+    const [vector] = vectors
+    if (dimensions === undefined || vector === undefined) return undefined
+    if (embedder === this.#embedder && dimensions !== this.#dimensions) {
+      this.#dimensions = dimensions
+      this.scheduleEmbedding()
+    }
+    return [...vector]
+  }
+
+  /**
+   * Check a provider's answer is one vector per input, all finite and of one non-zero length.
+   * @param vectors - what the provider returned.
+   * @param expected - how many inputs were sent.
+   * @returns the common dimension, or undefined when the answer is unusable.
+   */
+  private static accepted(vectors: readonly (readonly number[])[], expected: number): number | undefined {
+    if (!Array.isArray(vectors) || vectors.length !== expected) return undefined
+    const dimensions = vectors[0]?.length ?? 0
+    if (dimensions === 0) return undefined
+    const usable = vectors.every(vector =>
+      Array.isArray(vector) && vector.length === dimensions && vector.every(value => Number.isFinite(value)))
+    return usable ? dimensions : undefined
   }
 
   /**
@@ -642,16 +856,30 @@ export class ProjectMemory {
   }
 
   /**
-   * Embed everything still missing a vector for the current model.
+   * Embed everything still missing a vector for the current model and dimension.
+   *
+   * Every loop either stores a whole batch — which moves those rows out of the backlog — or stops.
+   * An unusable answer (too few vectors, empty or non-finite ones, mixed lengths) stops the pass
+   * rather than retrying it: storing nothing leaves the backlog exactly as it was, and asking again
+   * immediately would spin on a provider that keeps answering the same way.
    * @returns how many memories were embedded.
    */
   async drainEmbeddings(): Promise<number> {
     const embedder = this.#embedder
     if (embedder === undefined) return 0
     let embedded = 0
+    if (this.#dimensions === undefined) {
+      const probed = await this.probeDimensions(embedder)
+      if (probed === undefined) return 0
+      embedded += probed
+    }
+    let dimensionChanges = 0
     for (;;) {
-      if (this.#abort.signal.aborted) return embedded
-      const pending = await this.store.withoutEmbedding(embedder.model, this.options.embedBatch, Date.now())
+      if (this.#abort.signal.aborted || this.#embedder !== embedder) return embedded
+      const batch = this.#options().embedBatch
+      const identity = this.#identity()
+      if (identity === undefined) return embedded
+      const pending = await this.store.withoutEmbedding(identity, batch, Date.now())
       if (pending.length === 0) return embedded
       let vectors: readonly (readonly number[])[]
       try {
@@ -664,13 +892,44 @@ export class ProjectMemory {
         // searchable lexically and re-queued for the next pass; retrying here would spin.
         return embedded
       }
+      const dimensions = ProjectMemory.accepted(vectors, pending.length)
+      if (dimensions === undefined || this.#embedder !== embedder) return embedded
+      const changed = this.#dimensions !== undefined && dimensions !== this.#dimensions
+      this.#dimensions = dimensions
       for (const [index, memory] of pending.entries()) {
-        const vector = vectors[index]
-        if (vector === undefined) continue
-        await this.store.setEmbedding(memory.id, vector, embedder.model)
-        embedded += 1
+        await this.store.setEmbedding(memory.id, vectors[index] as readonly number[], embedder.model)
       }
-      if (pending.length < this.options.embedBatch) return embedded
+      embedded += pending.length
+      // A dimension change mid-pass strands what was stored before it, so look again — once; a
+      // provider that keeps changing its mind is not something a loop can settle.
+      if (changed) { dimensionChanges += 1; if (dimensionChanges > 1) return embedded; continue }
+      if (pending.length < batch) return embedded
     }
+  }
+
+  /**
+   * Learn the dimension a provider emits today, when it did not say, by re-embedding one memory the
+   * same model embedded before. That spends the call on real work — the memory's vector is refreshed
+   * — and tells whether vectors stored under this model name are still comparable.
+   * @param embedder - the attached provider.
+   * @returns how many memories the probe embedded (0 or 1), or undefined when the pass should stop.
+   */
+  private async probeDimensions(embedder: Embedder): Promise<number | undefined> {
+    const sample = await this.store.embeddedBy(embedder.model, Date.now())
+    // Nothing is stored under this model yet, so nothing can be stranded; the first batch will tell.
+    if (sample === undefined) return 0
+    let vectors: readonly (readonly number[])[]
+    try {
+      vectors = await embedder.embed([embeddingText(sample.title, sample.content)], this.#abort.signal)
+    } catch {
+      // Same reasoning as a failed batch: stop, and let the next pass try again.
+      return undefined
+    }
+    const dimensions = ProjectMemory.accepted(vectors, 1)
+    const [vector] = vectors
+    if (dimensions === undefined || vector === undefined || this.#embedder !== embedder) return undefined
+    this.#dimensions = dimensions
+    await this.store.setEmbedding(sample.id, vector, embedder.model)
+    return 1
   }
 }

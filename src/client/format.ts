@@ -30,6 +30,19 @@ export function isRule(category: MemoryCategoryWire): boolean {
 }
 
 /**
+ * Whether an agent, rather than a person, wrote a memory.
+ *
+ * Mirrors the Host's authorship test (`isAgentAuthored` in `domain/authorship.ts`): the wire already
+ * carries `source`, and the tools stamp exactly this label on everything an agent writes.
+ * @param memory - the memory, or just its source.
+ * @param memory.source - who wrote it.
+ * @returns true when an agent wrote it.
+ */
+export function isAgentAuthored(memory: { readonly source: string }): boolean {
+  return memory.source === 'assistant'
+}
+
+/**
  * The translated name of a category.
  * @param t - the namespace-bound translate.
  * @param category - the category.

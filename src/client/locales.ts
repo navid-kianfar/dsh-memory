@@ -71,6 +71,8 @@ export const zh = {
   'card.embedded': '已向量化',
   'card.notEmbedded': '未向量化',
   'card.match': '匹配度 {score}',
+  'card.agentAuthored': '由智能体添加',
+  'card.agentAuthoredHint': '这条规则由智能体记录，而非由你编写。智能体不能修改或归档你编写的规则。',
 
   'trace.empty': '没有历史记录。',
   'trace.create': '创建',
@@ -227,6 +229,8 @@ export const en: Record<MemoryKey, string> = {
   'card.embedded': 'Vector stored',
   'card.notEmbedded': 'No vector',
   'card.match': 'Match {score}',
+  'card.agentAuthored': 'Added by an agent',
+  'card.agentAuthoredHint': 'An agent recorded this rule; you did not write it. Agents cannot change or retire the rules you write.',
 
   'trace.empty': 'No history for this memory.',
   'trace.create': 'created',

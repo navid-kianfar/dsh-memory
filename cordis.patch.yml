@@ -13,13 +13,18 @@
       config:
         # Relative to each project's directory, so every project owns its own memory and none of it
         # follows you to another checkout. An absolute path here would make one memory serve all.
+        # Changing it at runtime moves tools and running agents to the new file together.
         databasePath: .dsh/memory.db
         # The rule block is a system-prompt section: re-read at every assembly, so rules survive
         # context compaction. Turning this off keeps the store and the tools but stops enforcement.
+        # The block is bounded (2,000 characters per rule, 24,000 in all); rules an agent added are
+        # marked as such, and are the first left out when the block is full.
         injectRules: true
         # The last session summary, sprint goals, and recent decisions, injected once at session
         # start. History rather than obligation, so it is not repeated per request.
         injectSessionContext: true
+        # One memory session per top-level agent. Subagents are bound by the rules but open no
+        # session, receive no session context, and cannot add rules.
         autoSession: true
         # `once` reminds the model to file a summary at the first stop boundary of a session and
         # never again. `every-turn` matches the Claude Code Stop-hook behaviour; `never` is silent.
@@ -40,6 +45,7 @@
       config:
         # `core` is search, store, recall, rules, add-rule, and end-session. `full` adds listing,
         # editing, archiving, and the audit trail, at the cost of more prompt tokens every request.
+        # Neither lets an agent edit or retire a rule the user wrote.
         toolset: core
 
     # The BARE package name, deliberately: the Web Client discovers a browser half by resolving

@@ -57,6 +57,15 @@ export const LIST_LIMIT_MAX = 500
 /** Largest number of hits one search returns. */
 export const SEARCH_LIMIT_MAX = 100
 
+/** Longest accepted source label, such as the file name an import records. */
+export const SOURCE_MAX_CHARS = 64
+
+/** Largest instructions file an import reads; a guard against pasting a whole repository. */
+export const IMPORT_TEXT_MAX_CHARS = 1_000_000
+
+/** Most memories one import may create. */
+export const IMPORT_ENTRY_LIMIT = 1000
+
 /**
  * Require a non-empty string within a length bound.
  * @param value - the value to check.
@@ -197,7 +206,7 @@ export function parseCreate(raw: Record<string, unknown>): CreateMemoryInput {
   const priority = raw['priority'] === undefined
     ? 0
     : requireInteger(raw['priority'], 'priority', PRIORITY_MIN, PRIORITY_MAX)
-  const source = raw['source'] === undefined ? 'assistant' : requireText(raw['source'], 'source', 64)
+  const source = raw['source'] === undefined ? 'assistant' : requireText(raw['source'], 'source', SOURCE_MAX_CHARS)
   const metadata = requireMetadata(raw['metadata'])
   return {
     category: requireCategory(raw['category']),
@@ -278,8 +287,11 @@ export function parseSearchQuery(raw: Record<string, unknown>): SearchQuery {
   if (raw['category'] !== undefined) query.category = requireCategory(raw['category'])
   if (raw['tags'] !== undefined) query.tags = requireTags(raw['tags'])
   if (raw['limit'] !== undefined) query.limit = requireInteger(raw['limit'], 'limit', 1, SEARCH_LIMIT_MAX)
-  if (raw['min_similarity'] ?? raw['minSimilarity']) {
-    const value = raw['min_similarity'] ?? raw['minSimilarity']
+  // Tested against undefined rather than for truthiness: a floor of 0 is a real request ("return
+  // everything that matched at all"), not an absent one.
+  const floor = raw['min_similarity'] ?? raw['minSimilarity']
+  if (floor !== undefined) {
+    const value = floor
     if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
       throw new MemoryInputError('min_similarity must be a number between 0 and 1')
     }
@@ -288,4 +300,17 @@ export function parseSearchQuery(raw: Record<string, unknown>): SearchQuery {
   const budget = raw['token_budget'] ?? raw['tokenBudget']
   if (budget !== undefined) query.tokenBudget = requireInteger(budget, 'token_budget', 1, 1_000_000)
   return query
+}
+
+/**
+ * Validate an instructions-file import before anything is parsed out of it.
+ * @param raw - the caller's payload.
+ * @returns the file's text and the source label each imported memory records.
+ * @throws MemoryInputError when the text is empty or too large, or the label is invalid.
+ */
+export function parseImport(raw: Record<string, unknown>): { readonly text: string, readonly source: string } {
+  return {
+    text: requireText(raw['text'], 'text', IMPORT_TEXT_MAX_CHARS),
+    source: requireText(raw['source'], 'source', SOURCE_MAX_CHARS),
+  }
 }

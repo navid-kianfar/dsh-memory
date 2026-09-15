@@ -14,6 +14,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Button, IconCloseOutline16, IconSearchOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { MemoryCategoryWire, MemoryStatusWire, MemoryView } from '../host/types.ts'
 import type { MemoryScreenProps } from './contract.ts'
+import { LIST_LIMIT_MAX } from '../domain/validate.ts'
 import { MemoryCard } from './MemoryCard.tsx'
 import { Alert, Select, type SelectOption, type SelectTone } from './ui/index.ts'
 import { cx } from './cx.ts'
@@ -227,8 +228,10 @@ export function MemoryList(props: MemoryListProps) {
               />
             ))}
           </div>
-          {!searching && state.value.rows.length < state.value.total && (
-            <Button variant="outline" size="sm" onClick={() => { setLimit(limit + PAGE_SIZE) }}>
+          {/* The Host refuses a page larger than LIST_LIMIT_MAX, so "more" stops growing the page there
+              rather than turning the listing into an error. */}
+          {!searching && state.value.rows.length < state.value.total && limit < LIST_LIMIT_MAX && (
+            <Button variant="outline" size="sm" onClick={() => { setLimit(Math.min(limit + PAGE_SIZE, LIST_LIMIT_MAX)) }}>
               {t('list.more')}
             </Button>
           )}
