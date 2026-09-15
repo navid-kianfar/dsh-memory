@@ -186,6 +186,27 @@ describe('result schemas', () => {
     expect(schemaOf(descriptor('describe').result).parse(value)).toEqual(value)
   })
 
+  it('carries the toolset in force when a tools row reports one', () => {
+    const value: MemoryOverviewResult = {
+      ok: true,
+      overview: {
+        project: 'app',
+        projectRoot: '/tmp/app',
+        databasePath: '/tmp/app/.dsh/memory.db',
+        stats: { total: 0, active: 0, archived: 0, expired: 0, embedded: 0, byCategory: [] },
+        embedding: { available: false, provider: 'none', ready: false },
+        mandatory: [],
+        forbidden: [],
+        rulesBlock: '',
+        enforcing: true,
+        toolset: 'full',
+      },
+    }
+    const schema = schemaOf(descriptor('describe').result)
+    expect(schema.parse(value)).toEqual(value)
+    expect(() => schema.parse({ ...value, overview: { ...value.overview, toolset: 'everything' } })).toThrow()
+  })
+
   it('round-trips a failure, which every endpoint may answer with', () => {
     const value = { ok: false, code: 'not-found', message: 'no memory with id "x"' }
     for (const entry of descriptors) {

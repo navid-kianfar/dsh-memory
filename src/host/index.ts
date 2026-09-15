@@ -89,6 +89,12 @@ const SESSION_LIMIT = 50
 /** Version stamped into an export document, so an importer knows what it is reading. */
 const EXPORT_VERSION = 1
 
+/** Which model-facing tools are registered: the core set, or the core set plus curation. */
+export type MemoryToolset = MemorySettings['toolset']
+
+/** The settings field whose saved value overrides the tools row's own toolset. */
+const TOOLSET_FIELD = 'toolset' satisfies keyof MemorySettings
+
 /**
  * Translate a rejection into the failure union the browser branches on.
  * @param error - the caught value.
@@ -198,6 +204,12 @@ export class MemoryService extends TypertRemoteService {
   /** The database path open projects were resolved under, to notice when a settings change moves it. */
   private appliedDatabasePath: string
   private source: () => Config
+  /** The fields a person saved in the settings section; undefined while no provider is attached. */
+  private userLayer: () => Readonly<Record<string, unknown>> | undefined = () => undefined
+  /** Callbacks the tools row registered to re-register when the chosen toolset may have changed. */
+  private readonly toolsetWatchers = new Set<() => void>()
+  /** The toolset the tools row last registered, for the settings card; undefined without that row. */
+  private registeredToolset: MemoryToolset | undefined
 
   /**
    * @param ctx - Host context; the embedding provider is resolved optionally so a deployment
@@ -210,6 +222,7 @@ export class MemoryService extends TypertRemoteService {
     this.appliedDatabasePath = config.databasePath
     installSettingsSection(ctx, MEMORY_SETTINGS_NAMESPACE, MemoryService.Config, config, {
       setSource: (current) => { this.source = current },
+      setUserLayer: (current) => { this.userLayer = current },
       // Ranking, retention, and injection settings are read inside each call and each prompt
       // assembly — open projects read them through a function — so a committed change reaches the
       // next request with nothing to rebuild. A moved database is the one change that re-resolves
@@ -406,8 +419,55 @@ export class MemoryService extends TypertRemoteService {
     return { ...await engine.describe(), available: true }
   }
 
-  /** React to a committed settings change: only a moved database needs more than the next read. */
+  /**
+   * The toolset the model should get, given the tools row's own configuration.
+   *
+   * The tools are a separate composition row with a separate config, but the settings card edits this
+   * plugin's one settings section. A `toolset` a person SAVED in that section — from the card, or in
+   * the settings document — therefore wins; otherwise the tools row's own value stands. Only the user
+   * layer counts: the section's resolved value always has a toolset (the schema defaults it), so
+   * reading that would silently override a tools row a deployment set to `full`.
+   * @param fallback - the tools row's configured toolset.
+   * @returns the toolset to register.
+   */
+  toolsetFor(fallback: MemoryToolset): MemoryToolset {
+    const saved = this.userLayer()
+    if (saved === undefined || !Object.hasOwn(saved, TOOLSET_FIELD)) return fallback
+    // The resolved value, not the raw field: the provider keeps the last good value when a stored
+    // section fails validation, and the raw field is exactly what failed.
+    return this.source().toolset
+  }
+
+  /**
+   * Be told whenever the chosen toolset may have changed.
+   * @param watcher - re-reads {@link toolsetFor} and re-registers what changed.
+   * @returns the disposer that stops the notifications.
+   */
+  watchToolset(watcher: () => void): () => void {
+    this.toolsetWatchers.add(watcher)
+    return () => { this.toolsetWatchers.delete(watcher) }
+  }
+
+  /**
+   * Record what the tools row registered, so the settings card shows the toolset in force rather than
+   * a stored value that may be yielding to that row.
+   * @param toolset - the registered toolset, or undefined when the tools row unloads.
+   */
+  noteRegisteredToolset(toolset: MemoryToolset | undefined): void {
+    this.registeredToolset = toolset
+  }
+
+  /**
+   * React to a committed settings change: a moved database re-resolves projects, a toolset choice
+   * re-registers tools, and everything else is read on the next request.
+   */
   private applySettings(): void {
+    this.moveIfDatabaseChanged()
+    for (const watcher of [...this.toolsetWatchers]) watcher()
+  }
+
+  /** Move open projects and live agents when the configured database path changed. */
+  private moveIfDatabaseChanged(): void {
     const databasePath = this.source().databasePath
     if (databasePath === this.appliedDatabasePath) return
     this.appliedDatabasePath = databasePath
@@ -633,6 +693,7 @@ export class MemoryService extends TypertRemoteService {
           forbidden: rules.forbidden.map(toMemoryView),
           rulesBlock: project.rulesBlock(),
           enforcing: this.source().injectRules,
+          ...this.registeredToolset === undefined ? {} : { toolset: this.registeredToolset },
         },
       }
     } catch (error) {

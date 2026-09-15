@@ -29,6 +29,13 @@ const COLUMNS = 'id, category, title, content, summary, tags, entities, related_
 /** The predicate for "a memory that currently counts": active and not past its retention date. */
 const LIVE = "status = 'active' AND (expires_at IS NULL OR expires_at > ?)"
 
+/**
+ * The predicate for "a memory that has expired": swept, or still stored active but past its date.
+ * The complement of {@link LIVE} among non-archived rows, so no memory falls between the two filters
+ * while it waits for a session start to sweep it.
+ */
+const EXPIRED = "(status = 'expired' OR (status = 'active' AND expires_at IS NOT NULL AND expires_at <= ?))"
+
 /** The `category IN (...)` fragment naming the two rule categories. */
 const RULE_IN = RULE_CATEGORIES.map(category => `'${category}'`).join(', ')
 
@@ -209,15 +216,17 @@ export class MemoryStore {
    * Titles are not unique — nothing stops two decisions sharing one — so the most recently updated
    * match wins. That is the one a person naming a title from memory almost always means.
    * @param title - the exact title.
+   * @param now - the current time; a memory past its retention date is not active, swept or not.
    * @returns the memory, or undefined when no active memory carries that title.
    */
-  async getByTitle(title: string): Promise<Memory | undefined> {
+  async getByTitle(title: string, now: number): Promise<Memory | undefined> {
     return this.serialize(async (connection) => {
       const statement = await connection.prepare(
-        `SELECT ${COLUMNS} FROM memories WHERE title = $1 AND status = 'active' `
+        `SELECT ${COLUMNS} FROM memories WHERE title = $1 AND ${LIVE.replace('?', '$2')} `
         + 'ORDER BY updated_at DESC LIMIT 1',
       )
       statement.bindVarchar(1, title)
+      statement.bindBigInt(2, BigInt(now))
       const [row] = (await statement.runAndReadAll()).getRowObjects()
       return row === undefined ? undefined : toMemory(row)
     })
@@ -240,13 +249,30 @@ export class MemoryStore {
 
     const where: string[] = []
     const bind: ((statement: DuckDBPreparedStatement, index: number) => void)[] = []
+    const bindNow = (statement: DuckDBPreparedStatement, index: number): void => {
+      statement.bindBigInt(index, BigInt(now))
+    }
+    // Classified by the status a memory has NOW, not the stored one, so an expired-but-unswept row is
+    // under Expired rather than under neither filter.
     const status = query.status ?? 'active'
-    if (status === 'active') {
-      where.push(LIVE.replace('?', `$${bind.length + 1}`))
-      bind.push((statement, index) => { statement.bindBigInt(index, BigInt(now)) })
-    } else if (status !== 'all') {
-      where.push(`status = $${bind.length + 1}`)
-      bind.push((statement, index) => { statement.bindVarchar(index, status) })
+    switch (status) {
+      case 'active':
+        where.push(LIVE.replace('?', `$${bind.length + 1}`))
+        bind.push(bindNow)
+        break
+      case 'expired':
+        where.push(EXPIRED.replace('?', `$${bind.length + 1}`))
+        bind.push(bindNow)
+        break
+      case 'archived':
+        where.push("status = 'archived'")
+        break
+      case 'all':
+        break
+      default: {
+        const unexpected: never = status
+        throw new Error(`unknown status filter "${String(unexpected)}"`)
+      }
     }
     if (query.category !== undefined) {
       const category = query.category
@@ -613,7 +639,7 @@ export class MemoryStore {
         'SELECT count(*) AS total, '
         + `count(*) FILTER (WHERE ${LIVE.replace('?', '$1')}) AS active, `
         + "count(*) FILTER (WHERE status = 'archived') AS archived, "
-        + `count(*) FILTER (WHERE status = 'expired' OR (status = 'active' AND expires_at IS NOT NULL AND expires_at <= $1)) AS expired, `
+        + `count(*) FILTER (WHERE ${EXPIRED.replace('?', '$1')}) AS expired, `
         + `count(*) FILTER (WHERE ${LIVE.replace('?', '$1')} AND embedding_dim IS NOT NULL) AS embedded `
         + 'FROM memories',
       )

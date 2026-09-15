@@ -15,7 +15,7 @@ import { randomUUID } from 'node:crypto'
 import { MemoryStore, type EmbeddingIdentity, type StoredMemory } from './store.ts'
 import { blendSimilarity, relevance, scoreLexical, type RelevanceWeights } from '../domain/score.ts'
 import { embeddingText, estimateTokens, extractEntities, projectSlug, queryTerms, summarize } from '../domain/text.ts'
-import { expiresAt } from '../domain/retention.ts'
+import { asOf, effectiveStatus, expiresAt } from '../domain/retention.ts'
 import { renderRules } from '../domain/rules.ts'
 import { MemoryNotFoundError } from '../domain/validate.ts'
 import {
@@ -381,7 +381,9 @@ export class ProjectMemory {
       columns['embedding_model'] = null
       columns['embedding_dim'] = null
     }
-    const restored = patch.status === 'active' && existing.status !== 'active'
+    // Judged at the write time: a memory still stored active but past its date is expired, and
+    // restoring it without a fresh window would leave it expired the moment it came back.
+    const restored = patch.status === 'active' && effectiveStatus(existing, now) !== 'active'
     if (patch.category !== undefined || patch.priority !== undefined || restored) {
       const priority = (columns['priority'] as number | undefined) ?? existing.priority
       columns['expires_at'] = expiresAt(category, priority, now, options.retentionDays) ?? null
@@ -495,10 +497,11 @@ export class ProjectMemory {
    * Read a filtered page of memories.
    * @param query - the validated filters and paging.
    * @param now - the current time, for evaluating expiry.
-   * @returns the page and the unpaged total.
+   * @returns the page and the unpaged total, each memory carrying the status it has at `now`.
    */
   async list(query: ListMemoriesQuery, now: number): Promise<MemoryPage> {
-    return this.store.list(query, now)
+    const page = await this.store.list(query, now)
+    return { ...page, memories: page.memories.map(memory => asOf(memory, now)) }
   }
 
   /**
@@ -513,15 +516,17 @@ export class ProjectMemory {
   /**
    * Read one memory by id or exact title, and count the read.
    * @param selector - the id or the exact title to find.
-   * @param now - the current time.
+   * @param now - the current time; a title only finds a memory still active at it.
    * @param origin - the calling agent, whose session the read is counted against.
-   * @returns the memory.
+   * @returns the memory, carrying the status it has at `now` — so an id naming a memory past its
+   *   retention date answers `expired` even before a session start has swept it.
    * @throws MemoryNotFoundError when nothing matches.
    */
   async recall(selector: { id?: string, title?: string }, now: number, origin?: WriteOrigin): Promise<Memory> {
-    const memory = selector.id !== undefined
+    const stored = selector.id !== undefined
       ? await this.store.get(selector.id)
-      : selector.title !== undefined ? await this.store.getByTitle(selector.title) : undefined
+      : selector.title !== undefined ? await this.store.getByTitle(selector.title, now) : undefined
+    const memory = stored === undefined ? undefined : asOf(stored, now)
     if (memory === undefined) {
       const named = selector.id ?? selector.title ?? '(nothing)'
       throw new MemoryNotFoundError(`no memory matches "${named}"`)
@@ -716,28 +721,40 @@ export class ProjectMemory {
 
   /**
    * Close a memory session with the summary the next one opens with.
+   *
+   * Only the caller's own open session can be closed. A session id is a claim, not a credential: the
+   * sessions table holds rows from other processes and from earlier runs, and closing one of those
+   * would file this agent's summary as that session's last word. Ownership lives only in this object
+   * — the row records no owner — so a session this object did not open for this owner is refused,
+   * whatever agent id opened it elsewhere; the next session start closes it as an orphan instead.
    * @param sessionId - the session to close; defaults to the owner's own open session.
    * @param summary - what the next session needs to know.
    * @param now - the end time.
    * @param owner - the harness session id of the calling agent.
-   * @returns whether an open session was closed.
-   * @throws MemoryForbiddenError when the named session belongs to another live agent.
+   * @returns whether an open session was closed; false when the owner has none open.
+   * @throws MemoryForbiddenError when the named session belongs to another live agent, or is not the
+   *   owner's own open session.
    */
   async endSession(
     sessionId: string | undefined, summary: string, now: number, owner: string = HOST_SESSION_OWNER,
   ): Promise<boolean> {
-    const id = sessionId ?? this.#sessions.get(owner)?.id
-    if (id === undefined) return false
-    const holder = [...this.#sessions.entries()].find(([, session]) => session.id === id)
+    const own = this.#sessions.get(owner)
+    const holder = [...this.#sessions.entries()].find(([, session]) => session.id === sessionId)
     if (holder !== undefined && holder[0] !== owner) {
       throw new MemoryForbiddenError(
-        `memory session "${id}" belongs to another agent; call memory_session_end without a session_id `
+        `memory session "${sessionId}" belongs to another agent; call memory_session_end without a session_id `
         + 'to file your summary against your own session',
       )
     }
-    const counters = holder?.[1]
-    const closed = await this.store.endSession(id, summary, counters?.created ?? 0, counters?.accessed ?? 0, now)
-    if (holder !== undefined && this.#sessions.get(owner)?.id === id) this.#sessions.delete(owner)
+    if (sessionId !== undefined && sessionId !== own?.id) {
+      throw new MemoryForbiddenError(
+        `memory session "${sessionId}" is not one this agent opened, or it has already ended; call `
+        + 'memory_session_end without a session_id to file your summary against your own session',
+      )
+    }
+    if (own === undefined) return false
+    const closed = await this.store.endSession(own.id, summary, own.created, own.accessed, now)
+    if (this.#sessions.get(owner)?.id === own.id) this.#sessions.delete(owner)
     return closed
   }
 

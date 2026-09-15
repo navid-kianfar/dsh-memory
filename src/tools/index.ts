@@ -38,6 +38,9 @@ export interface Config {
    * `core` registers search, store, recall, rules, add-rule, and end-session: enough for an agent to
    * remember and be bound. `full` adds listing, editing, archiving, and the audit trail, for
    * deployments where the agent rather than a person curates the memory.
+   *
+   * This is the default. A `toolset` saved in the `memory` settings section — the settings card's
+   * choice — overrides it live, without reloading this row.
    */
   toolset: 'core' | 'full'
 }
@@ -167,7 +170,40 @@ function ruleLine(rule: { title: string, content: string, source: string }): str
  */
 export function apply(ctx: Context, config: Config): void {
   const project = (agent: Agent | undefined): Promise<ProjectMemory> => projectFor(ctx, agent)
+  registerCoreTools(ctx, project)
 
+  // The curation tools follow the toolset chosen in settings while the plugin runs, rather than the
+  // value this row was loaded with: the settings card edits the `memory` section, and a choice made
+  // there that waited for a reload of this row would look, to the person making it, like no choice.
+  let curation: readonly (() => void)[] | undefined
+  const sync = (): void => {
+    const toolset = ctx.memory.toolsetFor(config.toolset)
+    ctx.memory.noteRegisteredToolset(toolset)
+    if (toolset === 'full' && curation === undefined) curation = registerCurationTools(ctx, project)
+    if (toolset === 'core' && curation !== undefined) {
+      for (const unregister of curation) unregister()
+      curation = undefined
+    }
+  }
+  sync()
+  ctx.effect(() => {
+    const unwatch = ctx.memory.watchToolset(sync)
+    return () => {
+      unwatch()
+      ctx.memory.noteRegisteredToolset(undefined)
+    }
+  }, 'dsh-memory: follow the toolset setting')
+}
+
+/** Resolves the project memory a tool call belongs to. */
+type ProjectResolver = (agent: Agent | undefined) => Promise<ProjectMemory>
+
+/**
+ * Register the tools every deployment gets: search, store, recall, rules, add-rule, end-session.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param project - resolves the calling agent's project memory.
+ */
+function registerCoreTools(ctx: Context, project: ProjectResolver): void {
   ctx.tools.register(defineTool({
     name: 'memory_search',
     description:
@@ -369,7 +405,7 @@ export function apply(ctx: Context, config: Config): void {
       + 'what you did. Call it once, when the work is done.',
     parameters: {
       summary: { type: 'string', required: true, description: 'What was decided, what is unfinished, and what comes next.' },
-      session_id: { type: 'string', description: 'The session to close; defaults to the one this agent opened. Another agent\'s session is refused.' },
+      session_id: { type: 'string', description: 'The session to close; defaults to the one this agent opened. Only that session can be closed: any other id — another agent\'s, another process\'s, or one that already ended — is refused.' },
     },
     output: {
       schema: {
@@ -398,164 +434,169 @@ export function apply(ctx: Context, config: Config): void {
       return { closed, ...sessionId === undefined ? {} : { sessionId } }
     },
   }))
+}
 
-  if (config.toolset !== 'full') return
-
-  ctx.tools.register(defineTool({
-    name: 'memory_list',
-    description:
-      'Browse this project\'s stored memory without searching: filter by category, tag, status, or '
-      + 'a substring, and page through the result. Use memory_search when you know what you are '
-      + 'looking for; use this to see what is there.',
-    parameters: {
-      category: { type: 'string', enum: [...MEMORY_CATEGORIES], description: `One of: ${CATEGORY_LIST}.` },
-      status: { type: 'string', enum: [...MEMORY_STATUSES, 'all'], description: 'Defaults to active. `all` includes archived and expired.' },
-      tags: { type: 'array', items: { type: 'string' }, description: 'Memories carrying any of these tags.' },
-      text: { type: 'string', description: 'Case-insensitive substring of the title, summary, or content.' },
-      limit: { type: 'integer', description: 'Page size (default 50).' },
-      offset: { type: 'integer', description: 'Rows to skip.' },
-      sort_by: { type: 'string', enum: [...MEMORY_SORT_KEYS], description: 'Defaults to updatedAt.' },
-      sort_order: { type: 'string', enum: ['asc', 'desc'], description: 'Defaults to desc.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          memories: { type: 'array', required: true, items: MEMORY_OUTPUT },
-          total: { type: 'integer', required: true },
-          offset: { type: 'integer', required: true },
-        },
+/**
+ * Register the curation tools the `full` toolset adds: list, update, archive, provenance.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param project - resolves the calling agent's project memory.
+ * @returns one disposer per tool, so a switch back to `core` can withdraw exactly these.
+ */
+function registerCurationTools(ctx: Context, project: ProjectResolver): readonly (() => void)[] {
+  return [
+    ctx.tools.register(defineTool({
+      name: 'memory_list',
+      description:
+        'Browse this project\'s stored memory without searching: filter by category, tag, status, or '
+        + 'a substring, and page through the result. Use memory_search when you know what you are '
+        + 'looking for; use this to see what is there.',
+      parameters: {
+        category: { type: 'string', enum: [...MEMORY_CATEGORIES], description: `One of: ${CATEGORY_LIST}.` },
+        status: { type: 'string', enum: [...MEMORY_STATUSES, 'all'], description: 'Defaults to active. `all` includes archived and expired.' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'Memories carrying any of these tags.' },
+        text: { type: 'string', description: 'Case-insensitive substring of the title, summary, or content.' },
+        limit: { type: 'integer', description: 'Page size (default 50).' },
+        offset: { type: 'integer', description: 'Rows to skip.' },
+        sort_by: { type: 'string', enum: [...MEMORY_SORT_KEYS], description: 'Defaults to updatedAt.' },
+        sort_order: { type: 'string', enum: ['asc', 'desc'], description: 'Defaults to desc.' },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.memories.length === 0
-          ? 'No memories match those filters.'
-          : `${value.memories.length} of ${value.total}:\n`
-            + value.memories.map(memory => `- [${memory.category}] ${memory.title} — ${memory.summary} (id ${memory.id})`).join('\n'),
-      }],
-    },
-    async execute(args, exec) {
-      const memory = await project(exec.agent)
-      const page = await memory.list(parseListQuery(args), Date.now())
-      return { memories: page.memories.map(out), total: page.total, offset: page.offset }
-    },
-  }))
-
-  ctx.tools.register(defineTool({
-    name: 'memory_update',
-    description:
-      'Change a stored memory in place — correct it, add what was learned since, or reclassify it. '
-      + 'Only the fields you supply change. Editing a rule changes what binds every later request. '
-      + 'A rule the user wrote can only be changed by the user, in the Memory tab.',
-    parameters: {
-      memory_id: { type: 'string', required: true, description: 'The memory to change.' },
-      title: { type: 'string' },
-      content: { type: 'string' },
-      tags: { type: 'array', items: { type: 'string' } },
-      priority: { type: 'integer', description: '0 to 3.' },
-      category: { type: 'string', enum: [...MEMORY_CATEGORIES], description: `One of: ${CATEGORY_LIST}.` },
-    },
-    output: { schema: MEMORY_OUTPUT, render: (_args, value) => [{ type: 'text', text: `Updated "${value.title}" (id ${value.id}).` }] },
-    async execute(args, exec) {
-      const memory = await project(exec.agent)
-      // Only the fields this tool declares: lifecycle and sidecar changes are the user's, from the
-      // manager, whatever else a generated argument object happens to carry.
-      const patch = parseUpdate({
-        memory_id: args.memory_id,
-        ...args.title === undefined ? {} : { title: args.title },
-        ...args.content === undefined ? {} : { content: args.content },
-        ...args.tags === undefined ? {} : { tags: args.tags },
-        ...args.priority === undefined ? {} : { priority: args.priority },
-        ...args.category === undefined ? {} : { category: args.category },
-      })
-      const written = await memory.update(patch, 'agent', Date.now(), originOf(exec.agent))
-      return out(written.memory)
-    },
-  }))
-
-  ctx.tools.register(defineTool({
-    name: 'memory_archive',
-    description:
-      'Retire a memory that is no longer true. It stops being recalled and, if it was a rule, stops '
-      + 'binding — but it stays restorable and auditable. Prefer this to deleting: a superseded '
-      + 'decision is part of how the project got here. A rule the user wrote can only be retired by the '
-      + 'user, in the Memory tab.',
-    parameters: {
-      memory_id: { type: 'string', required: true, description: 'The memory to retire.' },
-      reason: { type: 'string', description: 'Why it is no longer true; recorded on the audit trail.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          id: { type: 'string', required: true },
-          title: { type: 'string', required: true },
-          rulesChanged: { type: 'boolean', required: true },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            memories: { type: 'array', required: true, items: MEMORY_OUTPUT },
+            total: { type: 'integer', required: true },
+            offset: { type: 'integer', required: true },
+          },
         },
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.memories.length === 0
+            ? 'No memories match those filters.'
+            : `${value.memories.length} of ${value.total}:\n`
+              + value.memories.map(memory => `- [${memory.category}] ${memory.title} — ${memory.summary} (id ${memory.id})`).join('\n'),
+        }],
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: `Archived "${value.title}".${value.rulesChanged ? ' The binding rule set changed.' : ''}`,
-      }],
-    },
-    async execute(args, exec) {
-      const memory = await project(exec.agent)
-      const id = requireText(args.memory_id, 'memory_id', TITLE_MAX_CHARS)
-      const reason = args.reason === undefined ? undefined : requireText(args.reason, 'reason', 2000)
-      const written = await memory.archive(id, 'agent', Date.now(), reason, originOf(exec.agent))
-      return { id: written.memory.id, title: written.memory.title, rulesChanged: written.rulesChanged }
-    },
-  }))
-
-  ctx.tools.register(defineTool({
-    name: 'memory_provenance',
-    description:
-      'Read one memory\'s history: when it was written, every edit, and every time it was recalled. '
-      + 'Use it when the user asks who changed something, or when a memory contradicts what you '
-      + 'expected and you need to see how it got that way.',
-    parameters: {
-      memory_id: { type: 'string', required: true, description: 'The memory to trace.' },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          entries: {
-            type: 'array',
-            required: true,
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                seq: { type: 'integer', required: true },
-                operation: { type: 'string', required: true },
-                actor: { type: 'string', required: true },
-                at: { type: 'integer', required: true },
+      async execute(args, exec) {
+        const memory = await project(exec.agent)
+        const page = await memory.list(parseListQuery(args), Date.now())
+        return { memories: page.memories.map(out), total: page.total, offset: page.offset }
+      },
+    })),
+    ctx.tools.register(defineTool({
+      name: 'memory_update',
+      description:
+        'Change a stored memory in place — correct it, add what was learned since, or reclassify it. '
+        + 'Only the fields you supply change. Editing a rule changes what binds every later request. '
+        + 'A rule the user wrote can only be changed by the user, in the Memory tab.',
+      parameters: {
+        memory_id: { type: 'string', required: true, description: 'The memory to change.' },
+        title: { type: 'string' },
+        content: { type: 'string' },
+        tags: { type: 'array', items: { type: 'string' } },
+        priority: { type: 'integer', description: '0 to 3.' },
+        category: { type: 'string', enum: [...MEMORY_CATEGORIES], description: `One of: ${CATEGORY_LIST}.` },
+      },
+      output: { schema: MEMORY_OUTPUT, render: (_args, value) => [{ type: 'text', text: `Updated "${value.title}" (id ${value.id}).` }] },
+      async execute(args, exec) {
+        const memory = await project(exec.agent)
+        // Only the fields this tool declares: lifecycle and sidecar changes are the user's, from the
+        // manager, whatever else a generated argument object happens to carry.
+        const patch = parseUpdate({
+          memory_id: args.memory_id,
+          ...args.title === undefined ? {} : { title: args.title },
+          ...args.content === undefined ? {} : { content: args.content },
+          ...args.tags === undefined ? {} : { tags: args.tags },
+          ...args.priority === undefined ? {} : { priority: args.priority },
+          ...args.category === undefined ? {} : { category: args.category },
+        })
+        const written = await memory.update(patch, 'agent', Date.now(), originOf(exec.agent))
+        return out(written.memory)
+      },
+    })),
+    ctx.tools.register(defineTool({
+      name: 'memory_archive',
+      description:
+        'Retire a memory that is no longer true. It stops being recalled and, if it was a rule, stops '
+        + 'binding — but it stays restorable and auditable. Prefer this to deleting: a superseded '
+        + 'decision is part of how the project got here. A rule the user wrote can only be retired by the '
+        + 'user, in the Memory tab.',
+      parameters: {
+        memory_id: { type: 'string', required: true, description: 'The memory to retire.' },
+        reason: { type: 'string', description: 'Why it is no longer true; recorded on the audit trail.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            title: { type: 'string', required: true },
+            rulesChanged: { type: 'boolean', required: true },
+          },
+        },
+        render: (_args, value) => [{
+          type: 'text',
+          text: `Archived "${value.title}".${value.rulesChanged ? ' The binding rule set changed.' : ''}`,
+        }],
+      },
+      async execute(args, exec) {
+        const memory = await project(exec.agent)
+        const id = requireText(args.memory_id, 'memory_id', TITLE_MAX_CHARS)
+        const reason = args.reason === undefined ? undefined : requireText(args.reason, 'reason', 2000)
+        const written = await memory.archive(id, 'agent', Date.now(), reason, originOf(exec.agent))
+        return { id: written.memory.id, title: written.memory.title, rulesChanged: written.rulesChanged }
+      },
+    })),
+    ctx.tools.register(defineTool({
+      name: 'memory_provenance',
+      description:
+        'Read one memory\'s history: when it was written, every edit, and every time it was recalled. '
+        + 'Use it when the user asks who changed something, or when a memory contradicts what you '
+        + 'expected and you need to see how it got that way.',
+      parameters: {
+        memory_id: { type: 'string', required: true, description: 'The memory to trace.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            entries: {
+              type: 'array',
+              required: true,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  seq: { type: 'integer', required: true },
+                  operation: { type: 'string', required: true },
+                  actor: { type: 'string', required: true },
+                  at: { type: 'integer', required: true },
+                },
               },
             },
           },
         },
+        render: (_args, value) => [{
+          type: 'text',
+          text: value.entries.length === 0
+            ? 'No history for that memory.'
+            : value.entries.map(entry =>
+                `${new Date(entry.at).toISOString()} — ${entry.operation} by ${entry.actor}`).join('\n'),
+        }],
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: value.entries.length === 0
-          ? 'No history for that memory.'
-          : value.entries.map(entry =>
-              `${new Date(entry.at).toISOString()} — ${entry.operation} by ${entry.actor}`).join('\n'),
-      }],
-    },
-    async execute(args, exec) {
-      const memory = await project(exec.agent)
-      const id = requireText(args.memory_id, 'memory_id', TITLE_MAX_CHARS)
-      const entries = await memory.provenance(id, PROVENANCE_LIMIT)
-      return {
-        entries: entries.map(entry => ({
-          seq: entry.seq, operation: entry.operation, actor: entry.actor, at: entry.at,
-        })),
-      }
-    },
-  }))
+      async execute(args, exec) {
+        const memory = await project(exec.agent)
+        const id = requireText(args.memory_id, 'memory_id', TITLE_MAX_CHARS)
+        const entries = await memory.provenance(id, PROVENANCE_LIMIT)
+        return {
+          entries: entries.map(entry => ({
+            seq: entry.seq, operation: entry.operation, actor: entry.actor, at: entry.at,
+          })),
+        }
+      },
+    })),
+  ]
 }

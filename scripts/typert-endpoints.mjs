@@ -95,6 +95,7 @@ const OVERVIEW = `z.object({
   'forbidden': z.array(${MEMORY}).readonly(),
   'rulesBlock': z.string().readonly(),
   'enforcing': z.boolean().readonly(),
+  'toolset': z.union([z.literal("core"), z.literal("full")]).readonly().optional(),
 })`
 
 /** One ranked hit. */

@@ -128,6 +128,11 @@ export interface MemoryOverview {
   readonly rulesBlock: string
   /** Whether the plugin is injecting that block into model requests right now. */
   readonly enforcing: boolean
+  /**
+   * The toolset the model is given right now: a toolset saved in settings, else the tools row's own.
+   * Absent when no tools row is composed, so there is nothing registered to report.
+   */
+  readonly toolset?: 'core' | 'full'
 }
 
 /** A failure returned as a value, with a class the browser can branch on. */
@@ -312,6 +317,9 @@ export interface MemorySettings {
   candidateLimit: number
   /** Memories embedded per background pass. */
   embedBatch: number
-  /** Which model-facing tools to register. */
+  /**
+   * Which model-facing tools to register. Takes effect only once saved in the settings layer (the
+   * card, or the settings document); until then the `memory-tools` row's own `toolset` decides.
+   */
   toolset: 'core' | 'full'
 }

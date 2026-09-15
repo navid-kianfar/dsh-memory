@@ -68,6 +68,7 @@ const __achasoft_dsh_memory_memory_describe_result$schema = z.union([z.object({
 })).readonly(),
   'rulesBlock': z.string().readonly(),
   'enforcing': z.boolean().readonly(),
+  'toolset': z.union([z.literal("core"), z.literal("full")]).readonly().optional(),
 }).readonly(),
 }), z.object({
   'ok': z.literal(false).readonly(),

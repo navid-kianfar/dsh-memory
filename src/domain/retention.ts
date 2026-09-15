@@ -10,7 +10,7 @@
  * @module @achasoft/dsh-memory/domain/retention
  */
 
-import { RULE_MIN_PRIORITY, type MemoryCategory } from './types.ts'
+import { RULE_MIN_PRIORITY, type Memory, type MemoryCategory, type MemoryStatus } from './types.ts'
 
 /** Milliseconds in a day. */
 const DAY_MS = 86_400_000
@@ -70,4 +70,33 @@ export function expiresAt(
   const multiplier = PRIORITY_MULTIPLIER[priority]
   if (multiplier === null || multiplier === undefined) return undefined
   return now + Math.round(days * multiplier) * DAY_MS
+}
+
+/**
+ * The status a memory has at a moment, rather than the one stored for it.
+ *
+ * The stored status only turns `expired` when a session start sweeps, so between a memory's
+ * retention date and that sweep the row still says `active`. Everything a person or a model is shown
+ * is classified through this, so that window cannot make a memory active to one reader and expired
+ * to another.
+ * @param memory - the stored status and retention date.
+ * @param memory.status - the status as stored.
+ * @param memory.expiresAt - the retention date, absent when it never expires.
+ * @param now - the moment to classify at, epoch milliseconds.
+ * @returns `expired` for an active memory at or past its date, otherwise the stored status.
+ */
+export function effectiveStatus(memory: Pick<Memory, 'status' | 'expiresAt'>, now: number): MemoryStatus {
+  if (memory.status !== 'active' || memory.expiresAt === undefined) return memory.status
+  return memory.expiresAt > now ? 'active' : 'expired'
+}
+
+/**
+ * A memory as it stands at a moment: its status replaced by {@link effectiveStatus}.
+ * @param memory - the stored memory.
+ * @param now - the moment to classify at.
+ * @returns the same memory when nothing changed, or a copy carrying the effective status.
+ */
+export function asOf<M extends Memory>(memory: M, now: number): M {
+  const status = effectiveStatus(memory, now)
+  return status === memory.status ? memory : { ...memory, status }
 }

@@ -133,6 +133,9 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
     value: option,
     label: t(`settings.remind.${option}` as Parameters<typeof t>[0]),
   }))
+  // The toolset in force, not the stored field: until someone saves one, the tools row's own value
+  // decides, and showing the section's default would claim a toolset the model does not have.
+  const toolset = (overview.kind === 'loaded' ? overview.value.toolset : undefined) ?? settings.toolset
   const toolsets: readonly SelectOption<MemorySettings['toolset']>[] = TOOLSETS.map(option => ({
     value: option,
     label: t(`settings.toolset.${option}` as Parameters<typeof t>[0]),
@@ -211,7 +214,7 @@ export function MemorySettingsCard(props: MemorySettingsCardProps) {
           <div className={css.field}>
             <div className={css.head}><span className={css.label}>{t('settings.toolset')}</span></div>
             <Select
-              value={settings.toolset}
+              value={toolset}
               options={toolsets}
               label={t('settings.toolset')}
               disabled={!writable}

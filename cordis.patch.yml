@@ -38,14 +38,24 @@
         searchLimit: 10
         candidateLimit: 1000
         embedBatch: 64
-        toolset: core
+        # Days each category stays current, by category name. An absent category keeps the built-in
+        # table (session 30, sprint and feedback 90, devops and developer_docs 180, the rest 365);
+        # `0` means never expires. Rules never expire whatever this says. Applies to memories written,
+        # reclassified, or restored after the change, not to dates already stored.
+        retentionDays: {}
+        # How the match, recency, and read-count signals combine into a result's final ordering.
+        relevanceWeights:
+          similarity: 0.7
+          recency: 0.15
+          access: 0.15
 
     - id: memory-tools
       name: '@achasoft/dsh-memory/tools'
       config:
         # `core` is search, store, recall, rules, add-rule, and end-session. `full` adds listing,
         # editing, archiving, and the audit trail, at the cost of more prompt tokens every request.
-        # Neither lets an agent edit or retire a rule the user wrote.
+        # Neither lets an agent edit or retire a rule the user wrote. This is the default: a toolset
+        # saved from the Settings card (the `memory` settings section) overrides it live.
         toolset: core
 
     # The BARE package name, deliberately: the Web Client discovers a browser half by resolving

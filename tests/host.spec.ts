@@ -8,7 +8,7 @@
  * receive.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -18,6 +18,7 @@ import * as MemoryTools from '../src/tools/index.ts'
 import { MemoryService } from '../src/host/index.ts'
 import type { ProjectMemory } from '../src/host/memory.ts'
 import { EmbeddingEngine, type EmbeddingProviderInfo } from '../src/embedding/index.ts'
+import { DEFAULT_RELEVANCE_WEIGHTS } from '../src/domain/score.ts'
 
 /** The subset of `Agent` the plugin's hooks actually touch. */
 interface FakeAgent {
@@ -411,6 +412,76 @@ describe('agent-authored rules through the full toolset', () => {
   })
 })
 
+describe('the toolset chosen in settings', () => {
+  /** The curation tools `full` adds over `core`. */
+  const CURATION = ['memory_archive', 'memory_list', 'memory_provenance', 'memory_update']
+
+  /**
+   * A settings provider holding one user layer, attached through the provider's real section hook, so
+   * the plugin reads saved fields exactly as it does from the harness.
+   * @returns the provider and a save that commits a patch the way the settings card does.
+   */
+  function fakeSettings() {
+    let user: Record<string, unknown> = {}
+    let hooks: { setSource: (current: () => unknown) => void, onChange: () => void } | undefined
+    return {
+      provider: {
+        installSection(_owner: unknown, _ns: string, _schema: unknown, entry: object, sectionHooks: NonNullable<typeof hooks>) {
+          hooks = sectionHooks
+          sectionHooks.setSource(() => ({ ...entry, ...user }))
+          sectionHooks.onChange()
+        },
+        describe: () => [{ ns: 'memory', user }],
+      },
+      save(patch: Record<string, unknown>) {
+        user = { ...user, ...patch }
+        hooks?.onChange()
+      },
+    }
+  }
+
+  /**
+   * Restart the memory plugin under a settings provider, then compose the tools row.
+   * @param toolsRow - the `memory-tools` row's own toolset.
+   * @returns the settings provider's save.
+   */
+  async function composeWithSettings(toolsRow: 'core' | 'full') {
+    const settings = fakeSettings()
+    await fiber.dispose()
+    ctx.provide('settings', settings.provider as never)
+    fiber = await ctx.plugin(MemoryService, { ...CONFIG, databasePath: join(root, 'memory.db') })
+    await ctx.plugin(Tools, {})
+    await ctx.plugin(MemoryTools, { toolset: toolsRow })
+    return settings.save
+  }
+
+  /**
+   * Which curation tools are registered right now.
+   * @returns their names, sorted.
+   */
+  function curationTools(): string[] {
+    return ctx.tools.schemas().map(schema => schema.name).filter(name => CURATION.includes(name)).sort()
+  }
+
+  it('keeps the tools row\'s own toolset until one is saved, whatever the section defaults to', async () => {
+    await composeWithSettings('full')
+    expect(curationTools()).toEqual(CURATION)
+  })
+
+  it('registers and withdraws the curation tools live when the card saves a toolset', async () => {
+    const save = await composeWithSettings('core')
+    expect(curationTools()).toEqual([])
+
+    save({ toolset: 'full' })
+    expect(curationTools()).toEqual(CURATION)
+    const described = await ctx.memory.describe({ project: root })
+    expect(described.ok && described.overview.toolset).toBe('full')
+
+    save({ toolset: 'core' })
+    expect(curationTools()).toEqual([])
+  })
+})
+
 describe('settings changes reaching open projects and live agents', () => {
   it('honours a retention of 0 as "never expires"', async () => {
     changeSettings({ retentionDays: { session: 0 } })
@@ -520,5 +591,41 @@ describe('RPC input validation', () => {
     expect(await ctx.memory.importInstructions({ project: root, text: '# Rules\n- A rule', source: 'x'.repeat(200) }))
       .toMatchObject({ ok: false, code: 'invalid' })
     expect((await (await project()).rules(Date.now())).total).toBe(0)
+  })
+})
+
+describe('the shipped composition patch', () => {
+  /** The `memory` row's config block as the patch writes it: every line up to the next row. */
+  const memoryRow = (() => {
+    const patch = readFileSync(new URL('../cordis.patch.yml', import.meta.url), 'utf8')
+    const start = patch.indexOf('- id: memory\n')
+    const end = patch.indexOf('- id: memory-tools', start)
+    return patch.slice(start, end)
+  })()
+
+  it('restates every key of the memory row, because a profile override replaces the whole config', () => {
+    // `toolset` is the one key left out: on this row it is only a settings-card field, and the tools
+    // row's own `toolset` is the composed default.
+    const keys = Object.keys(MemoryService.Config.dict ?? {}).filter(key => key !== 'toolset')
+    const missing = keys.filter(key => !new RegExp(`^\\s{8}${key}:`, 'mu').test(memoryRow))
+    expect(missing).toEqual([])
+  })
+
+  it('ships the schema\'s own retention and ranking defaults', () => {
+    // Called with nothing, as a loader resolves a row whose config restates no key.
+    const resolved = MemoryService.Config()
+    expect(memoryRow).toMatch(/retentionDays: \{\}/u)
+    for (const [signal, weight] of Object.entries(resolved.relevanceWeights ?? {})) {
+      expect(memoryRow).toMatch(new RegExp(`^\\s{10}${signal}: ${weight}$`, 'mu'))
+    }
+  })
+
+  it('still loads an older override that restates the row without retention or ranking keys', () => {
+    const { retentionDays, relevanceWeights, ...older } = MemoryService.Config()
+    const resolved = MemoryService.Config({ ...older, databasePath: '.dsh/other.db' })
+    expect(resolved.databasePath).toBe('.dsh/other.db')
+    expect(resolved.retentionDays).toEqual(retentionDays)
+    expect(resolved.relevanceWeights).toEqual(relevanceWeights)
+    expect(relevanceWeights).toEqual(DEFAULT_RELEVANCE_WEIGHTS)
   })
 })

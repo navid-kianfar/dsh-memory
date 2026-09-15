@@ -266,6 +266,50 @@ describe('lifecycle', () => {
     expect((await memory.list({ status: 'active' }, after)).total).toBe(0)
     expect((await memory.stats(after)).expired).toBe(1)
   })
+
+  describe('a memory past its retention date that no session start has swept yet', () => {
+    /**
+     * Store a session note and return a moment just after its expiry, before any sweep.
+     * @returns the stored memory and that moment.
+     */
+    async function expiredUnswept() {
+      const { memory: stored } = await memory.create({
+        category: 'session', title: 'Old standup', content: 'Discussed the storage engine long ago.',
+      }, 'agent', NOW)
+      return { stored, after: stored.expiresAt! + 1 }
+    }
+
+    it('is listed under Expired, reported as expired, and not under Active', async () => {
+      const { stored, after } = await expiredUnswept()
+      const expired = await memory.list({ status: 'expired' }, after)
+      expect(expired.memories.map(entry => [entry.id, entry.status])).toEqual([[stored.id, 'expired']])
+      expect(expired.total).toBe(1)
+      expect((await memory.list({ status: 'active' }, after)).total).toBe(0)
+      expect((await memory.list({ status: 'all' }, after)).memories[0]?.status).toBe('expired')
+    })
+
+    it('is still Active the moment before its date', async () => {
+      const { stored } = await expiredUnswept()
+      const before = stored.expiresAt! - 1
+      expect((await memory.list({ status: 'active' }, before)).memories[0]?.status).toBe('active')
+      expect((await memory.list({ status: 'expired' }, before)).total).toBe(0)
+    })
+
+    it('is never served as active by recall or search', async () => {
+      const { stored, after } = await expiredUnswept()
+      expect((await memory.recall({ id: stored.id }, after)).status).toBe('expired')
+      await expect(memory.recall({ title: 'Old standup' }, after)).rejects.toThrow(/no memory matches/)
+      const found = await memory.search({ query: 'storage engine' }, after, AbortSignal.timeout(5000))
+      expect(found.hits).toHaveLength(0)
+    })
+
+    it('gets a fresh retention window when restored', async () => {
+      const { stored, after } = await expiredUnswept()
+      const { memory: restored } = await memory.restore(stored.id, 'user', after)
+      expect(restored.expiresAt).toBeGreaterThan(after)
+      expect((await memory.list({ status: 'active' }, after)).total).toBe(1)
+    })
+  })
 })
 
 describe('embeddings', () => {
@@ -397,8 +441,34 @@ describe('memory sessions per agent', () => {
   it('will not overwrite the summary of a session that already ended', async () => {
     const first = await memory.startSession(NOW, 'agent-a')
     expect(await memory.endSession(first.sessionId, 'The real summary.', NOW + 1, 'agent-a')).toBe(true)
-    expect(await memory.endSession(first.sessionId, 'A rewrite.', NOW + 2, 'agent-b')).toBe(false)
+    await expect(memory.endSession(first.sessionId, 'A rewrite.', NOW + 2, 'agent-b')).rejects.toThrow(/not one this agent opened/)
+    await expect(memory.endSession(first.sessionId, 'A rewrite.', NOW + 2, 'agent-a')).rejects.toThrow(/not one this agent opened/)
     expect((await memory.sessions(10))[0]?.summary).toBe('The real summary.')
+  })
+
+  it('refuses to close an open session no live agent here owns, such as another process\'s', async () => {
+    // Two ProjectMemory objects over one store: `elsewhere` stands in for another process, or a
+    // previous run, that opened a session this one never did.
+    const store = await MemoryStore.open(':memory:')
+    const here = new ProjectMemory(store, OPTIONS)
+    const elsewhere = new ProjectMemory(store, OPTIONS)
+    try {
+      // Started second, so this start's orphan sweep is not what closes the foreign row.
+      await here.startSession(NOW, 'agent-here')
+      const foreign = await elsewhere.startSession(NOW + 1, 'agent-elsewhere')
+
+      await expect(here.endSession(foreign.sessionId, 'Not mine to file.', NOW + 2, 'agent-here'))
+        .rejects.toThrow(/not one this agent opened/)
+      // The same agent id does not make it this process's session to close.
+      await expect(here.endSession(foreign.sessionId, 'Not mine either.', NOW + 2, 'agent-elsewhere'))
+        .rejects.toThrow(/not one this agent opened/)
+      const row = (await here.sessions(10)).find(entry => entry.id === foreign.sessionId)
+      expect(row?.endedAt).toBeUndefined()
+
+      expect(await elsewhere.endSession(foreign.sessionId, 'Filed by its owner.', NOW + 3, 'agent-elsewhere')).toBe(true)
+    } finally {
+      await here.close()
+    }
   })
 })
 

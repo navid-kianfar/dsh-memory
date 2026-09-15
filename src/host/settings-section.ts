@@ -35,11 +35,39 @@ export interface SettingsSectionHooks<T> {
    * @param value - the resolved section.
    */
   validate?: (value: T) => void
+  /**
+   * Receive a reader of the fields a person saved over the composition entry — the raw user layer —
+   * or a reader answering `undefined` while no provider is attached.
+   *
+   * The resolved source cannot say whether a value was chosen or merely defaulted, and a setting that
+   * yields to another row until someone picks it needs exactly that answer.
+   * @param current - thunk returning the user layer's fields, or undefined when there is none.
+   */
+  setUserLayer?: (current: () => Readonly<Record<string, unknown>> | undefined) => void
+}
+
+/** One namespace as the provider describes it; only the raw user layer is read here. */
+interface SettingsDescriptorFace {
+  readonly ns: string
+  readonly user?: unknown
 }
 
 /** The part of the harness settings provider this module calls. */
 interface SettingsProviderFace {
   installSection: <T>(owner: Context, ns: string, schema: z<T>, entry: T, hooks: SettingsSectionHooks<T>) => void
+  describe: () => readonly SettingsDescriptorFace[]
+}
+
+/**
+ * Read one namespace's raw user layer from the provider.
+ * @param provider - the attached settings provider.
+ * @param ns - the namespace to read.
+ * @returns the saved fields, or undefined when the namespace has no user section.
+ */
+function userLayerOf(provider: SettingsProviderFace, ns: string): Readonly<Record<string, unknown>> | undefined {
+  const user = provider.describe().find(descriptor => descriptor.ns === ns)?.user
+  if (typeof user !== 'object' || user === null || Array.isArray(user)) return undefined
+  return user as Record<string, unknown>
 }
 
 /**
@@ -72,6 +100,17 @@ export function installSettingsSection<T>(
 ): void {
   ctx.inject(['settings'], (settingsCtx) => {
     const provider = (settingsCtx as unknown as { settings: SettingsProviderFace }).settings
+    const { setUserLayer } = hooks
+    if (setUserLayer !== undefined) {
+      // Pointed at the provider BEFORE the section attaches, because attaching fires onChange and the
+      // first judgement must already see what was saved; pointed away again when the provider goes,
+      // and re-judged, so nothing keeps reading a detached provider's layer.
+      setUserLayer(() => userLayerOf(provider, ns))
+      settingsCtx.effect(() => () => {
+        setUserLayer(() => undefined)
+        hooks.onChange()
+      }, `${ns}: forget the settings user layer`)
+    }
     provider.installSection(ctx, ns, schema, entry, hooks)
   })
 }
