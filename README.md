@@ -2,7 +2,7 @@
 
 Persistent, per-project memory for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Each project gets a DuckDB file at `<project>/.dsh/memory.db` holding decisions, architecture notes, sprint goals, session summaries, and binding rules. Mandatory and forbidden rules are a system-prompt section, re-read on every model request, so they survive context compaction. Memories are ranked by keyword (BM25F) and, when an embeddings endpoint is configured, by vector similarity. The Web Client gets a **Memory** tab to browse and edit all of it.
 
-![The Memory tab beside Chat, showing a project's memories filtered by category, with the database path and active and embedded counts in the header](https://raw.githubusercontent.com/navid-kianfar/dsh-memory/main/docs/screenshots/memory-tab.png)
+![The Memory tab beside Chat, showing a project's memories, with the database path and active and embedded counts in the header](https://raw.githubusercontent.com/navid-kianfar/dsh-memory/main/docs/screenshots/memory-tab.png)
 
 ## Features
 
@@ -16,7 +16,7 @@ A **Memory** tab sits beside Chat in every session. It always shows the memory o
 
 Each memory card offers Edit, Archive or Restore, **Delete permanently** (removes the row and its audit trail, after confirmation), and **History**: the audit trail of creates, edits, reads, archives, restores, imports, and expiries.
 
-![A memory card with its History expanded, listing when it was created, edited, and read](https://raw.githubusercontent.com/navid-kianfar/dsh-memory/main/docs/screenshots/memory-card-history.png)
+![A decision card with its History expanded](https://raw.githubusercontent.com/navid-kianfar/dsh-memory/main/docs/screenshots/memory-card-history.png)
 
 ### Rules that bind every request
 
@@ -24,7 +24,7 @@ Rules are injected through the system prompt, not a message, so every request ca
 
 Rules an agent recorded carry an **Added by an agent** badge in the tab and an `[added by an agent]` label in the prompt. When an agent-added rule is present, the block also tells the model that the user's own rules win on conflict.
 
-![The Rules pane with one rule marked "Added by an agent" and the injected rule block expanded below](https://raw.githubusercontent.com/navid-kianfar/dsh-memory/main/docs/screenshots/memory-rules.png)
+![The Rules pane listing mandatory rules, one of them marked "Added by an agent"](https://raw.githubusercontent.com/navid-kianfar/dsh-memory/main/docs/screenshots/memory-rules.png)
 
 The injected text is bounded, because it is paid for on every request:
 
